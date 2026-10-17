@@ -94,6 +94,13 @@ jobs:
       - name: Expo prebuild
         run: npx expo prebuild --platform android --no-install
 
+      - name: Disable Sentry source-map upload
+        # This fork carries no SENTRY_AUTH_TOKEN/org/project secrets, so the
+        # @sentry/react-native gradle hook fails the release build trying to
+        # upload. Strip the apply (same approach as the F-Droid job below);
+        # crash reporting stays wired, only CI-side upload is skipped.
+        run: sed -i '/apply from.*sentry.gradle/d' android/app/build.gradle
+
       - name: Setup signing
         run: |
           if [[ "${{ github.ref }}" == refs/tags/v* && -n "${{ secrets.KEYSTORE_BASE64 }}" ]]; then

@@ -46,7 +46,7 @@ export async function handoffPushToken(force = false): Promise<boolean> {
     if (!token) return false
     if (!force && token === lastSentToken) return true
 
-    const { active } = useConnections.getState()
+    const { activeConnection: active } = useConnections.getState()
     if (!active) return false
 
     const url = pushUrlFromBase(active.url)
