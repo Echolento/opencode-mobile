@@ -56,12 +56,21 @@ export async function handoffPushToken(force = false): Promise<boolean> {
     const auth = buildAuth(active.username, password)
     const headers = buildRequestHeaders({ auth, directory: active.directory })
 
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { ...(headers as Record<string, string>), "Content-Type": "application/json" },
-      body: JSON.stringify({ token, platform: Platform.OS }),
-      signal: AbortSignal.timeout(10_000),
-    })
+    // AbortSignal.timeout() is not available in the RN/Hermes runtime — use a
+    // manual controller so a hung server can't leak the request forever.
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 10_000)
+    let res: Response
+    try {
+      res = await fetch(url, {
+        method: "POST",
+        headers: { ...(headers as Record<string, string>), "Content-Type": "application/json" },
+        body: JSON.stringify({ token, platform: Platform.OS }),
+        signal: controller.signal,
+      })
+    } finally {
+      clearTimeout(timer)
+    }
     if (!res.ok) {
       log.warn("push", `token handoff failed: ${res.status}`)
       return false
