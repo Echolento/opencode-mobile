@@ -117,6 +117,29 @@ export async function granted(): Promise<boolean> {
   return status === "granted"
 }
 
+/** The device's native push token (FCM on Android) used for server-side push.
+ *  Returns null when unavailable: not a physical device, permission not yet
+ *  granted, or the platform rejected the request. The token is opaque to the
+ *  app — it is handed to the server, never interpreted here. */
+export async function getDeviceToken(): Promise<string | null> {
+  try {
+    if (!Device.isDevice) return null
+    if (!(await granted())) return null
+    const res = await Notifications.getDevicePushTokenAsync()
+    const data = res?.data
+    return typeof data === "string" ? data : null
+  } catch {
+    return null
+  }
+}
+
+/** Subscribe to native push-token rotation (FCM tokens can rotate). Returns an
+ *  unsubscribe function. */
+export function onDeviceTokenChange(handler: () => void): () => void {
+  const sub = Notifications.addPushTokenListener(() => handler())
+  return () => sub.remove()
+}
+
 async function ensureChannel() {
   if (Platform.OS !== "android") return
   await Notifications.setNotificationChannelAsync("prompts", {

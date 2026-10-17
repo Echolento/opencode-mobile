@@ -16,6 +16,7 @@ import { AuthGate } from "../src/components/AuthGate"
 import { ErrorBoundary } from "../src/components/ErrorBoundary"
 import { TelemetryConsentModal } from "../src/components/TelemetryConsentModal"
 import * as notifications from "../src/lib/notifications"
+import { handoffPushToken } from "../src/lib/push"
 import { addBreadcrumb, wrap } from "../src/lib/sentry"
 import { loadTelemetryConsent, setTelemetryConsent } from "../src/lib/telemetry"
 import { initAnalytics, trackAppOpened } from "../src/lib/analytics"
@@ -136,7 +137,11 @@ function RootLayout() {
       // OS has a decision — so the ref just avoids redundant calls per session.
       if (!notifPermissionRequested.current) {
         notifPermissionRequested.current = true
-        void notifications.setup()
+        void notifications.setup().then((ok) => {
+          // Once the user has granted notifications, hand this device's FCM
+          // token to the server so it can push even when the app is killed.
+          if (ok) void handoffPushToken()
+        })
       }
     } else if (!client && sseStarted.current) {
       sseStarted.current = false
@@ -149,6 +154,13 @@ function RootLayout() {
       }
     }
   }, [client])
+
+  // Keep the server's copy of our push token fresh across FCM rotations.
+  useEffect(() => {
+    return notifications.onDeviceTokenChange(() => {
+      void handoffPushToken(true)
+    })
+  }, [])
 
   const isLoading = authLoading || connectionsLoading || consentState === "loading"
 
