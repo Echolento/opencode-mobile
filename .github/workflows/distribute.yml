@@ -1,0 +1,42 @@
+name: Distribute APK to Firebase
+
+# Distributes an already-built app-release APK to Firebase App Distribution
+# without rebuilding. Reuses the artifact from a prior "Build Android APK" run
+# so a failed/missing distribution step (e.g. an IAM role granted after the
+# fact) can be retried in ~1 minute instead of a full Gradle build.
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Actions run ID that holds the 'app-release' artifact"
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  distribute:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download app-release artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: app-release
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Distribute to Firebase App Distribution
+        env:
+          FIREBASE_SA_JSON: ${{ secrets.FIREBASE_SA_JSON }}
+          FIREBASE_APP_ID: ${{ secrets.FIREBASE_APP_ID }}
+        run: |
+          echo "$FIREBASE_SA_JSON" | base64 -d > "$RUNNER_TEMP/firebase-sa.json"
+          export GOOGLE_APPLICATION_CREDENTIALS="$RUNNER_TEMP/firebase-sa.json"
+          APK=$(ls app-release*.apk | head -1)
+          echo "Distributing $APK"
+          npx --yes firebase-tools@latest appdistribution:distribute "$APK" \
+            --app "$FIREBASE_APP_ID" \
+            --testers "hmza.m.sobhy@gmail.com" \
+            --release-notes "Custom build: reliable FCM push notifications"
