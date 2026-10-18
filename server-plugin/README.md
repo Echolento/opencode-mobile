@@ -40,6 +40,25 @@ Copy `opencode-mobile-push.ts` into your opencode plugins directory:
 
 Env overrides: `OPENCODE_PUSH_PROJECT`, `OPENCODE_PUSH_KEY_FILE`, `OPENCODE_PUSH_PORT`.
 
+### `OPENCODE_PUSH_HOST` (required)
+
+The token endpoint only starts in the process that has `OPENCODE_PUSH_HOST` set,
+and binds to it. This matters because **every** opencode process (the desktop app
+included) loads user plugins from the same directory; without the marker, whichever
+process binds `port` first would win it — with the wrong process's credentials —
+or starve the real server with `EADDRINUSE`.
+
+Set it in the launcher for `opencode serve`, to the interface the phone reaches
+(here, the Tailscale IP):
+
+```powershell
+$env:OPENCODE_PUSH_HOST = (tailscale ip -4)
+opencode serve --hostname $env:OPENCODE_PUSH_HOST --port 4096
+```
+
+The endpoint appears once a session exists (plugins instantiate lazily per
+project), so the app retries registration for a short while after connecting.
+
 ## What it does
 
 - Serves `POST /push/register` (HTTP Basic, the same `OPENCODE_SERVER_PASSWORD`

@@ -19,6 +19,11 @@ import { log } from "./logbuffer"
 const PUSH_PORT = 4097
 const PASSWORDS_PREFIX = "opencode_password_"
 
+// The plugin's endpoint only comes up once a session exists on the server (it
+// instantiates lazily per project context), so the first attempt right after
+// connect can race it. Retry with a widening gap before giving up.
+const RETRY_DELAYS_MS = [0, 3_000, 6_000, 12_000, 20_000]
+
 /** Derive the push-registration URL from the server base URL, swapping the
  *  port for the plugin's port (keeps scheme + host). */
 export function pushUrlFromBase(baseUrl: string, port = PUSH_PORT): string | null {
@@ -38,14 +43,29 @@ let lastSentToken: string | null = null
 
 /** Register this device's FCM token with the active server. Best-effort and
  *  idempotent: a no-op if there is no token, no active connection, or the same
- *  token was already accepted this session. Returns true when the server
- *  acknowledged the token. */
+ *  token was already accepted this session. Returns true once the server
+ *  acknowledges the token. */
 export async function handoffPushToken(force = false): Promise<boolean> {
+  let token: string | null = null
   try {
-    const token = await getDeviceToken()
-    if (!token) return false
-    if (!force && token === lastSentToken) return true
+    token = await getDeviceToken()
+  } catch (e) {
+    log.info("push", `no device token: ${String(e)}`)
+    return false
+  }
+  if (!token) return false
+  if (!force && token === lastSentToken) return true
 
+  for (const delay of RETRY_DELAYS_MS) {
+    if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay))
+    if (await attemptHandoff(token)) return true
+  }
+  log.info("push", "token handoff gave up after retries")
+  return false
+}
+
+async function attemptHandoff(token: string): Promise<boolean> {
+  try {
     const { activeConnection: active } = useConnections.getState()
     if (!active) return false
 

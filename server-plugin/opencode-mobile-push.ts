@@ -22,7 +22,10 @@ import crypto from "node:crypto"
 //     "keyFile": "~/.config/your-firebase/key.json",
 //     "port": 4097
 //   }
-// Env overrides: OPENCODE_PUSH_PROJECT, OPENCODE_PUSH_KEY_FILE, OPENCODE_PUSH_PORT
+// Env overrides: OPENCODE_PUSH_PROJECT, OPENCODE_PUSH_KEY_FILE, OPENCODE_PUSH_PORT.
+// OPENCODE_PUSH_HOST (e.g. the tailnet IP) is REQUIRED — the endpoint only
+// starts in the process given it, so the supervisor's `serve` binds and other
+// opencode processes stay silent. It is also the interface to bind.
 //
 // Registering a token (the app does this automatically):
 //   POST http://<host>:<port>/push/register   (HTTP Basic: <username>:<server password>)
@@ -42,6 +45,7 @@ const b64url = (b: Buffer | Uint8Array) => Buffer.from(b).toString("base64url")
 let cached: { token: string; exp: number } | null = null
 const lastSent = new Map<string, number>()
 const didWork = new Set<string>()
+let listenerStarted = false
 
 function expand(p: string): string {
   return p.startsWith("~/") ? path.join(os.homedir(), p.slice(2)) : p
@@ -150,7 +154,7 @@ function authorized(req: http.IncomingMessage): boolean {
 
 const trim = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1).trimEnd()}…` : s)
 
-export const OpenCodeMobilePushPlugin: Plugin = async ({ client, directory, serverUrl }) => {
+export const OpenCodeMobilePushPlugin: Plugin = async ({ client, directory }) => {
   const log = (level: "info" | "warn", message: string) => {
     try {
       void client.app.log({ body: { service: "opencode-mobile-push", level, message } })
@@ -172,38 +176,59 @@ export const OpenCodeMobilePushPlugin: Plugin = async ({ client, directory, serv
     return {}
   }
 
-  const host = serverUrl?.hostname ?? "127.0.0.1"
-  const server = http.createServer((req, res) => {
-    if (req.method !== "POST" || !req.url?.startsWith("/push/register")) {
-      res.writeHead(404).end()
-      return
-    }
-    if (!authorized(req)) {
-      res.writeHead(401).end()
-      return
-    }
-    let body = ""
-    req.on("data", (c) => {
-      body += c
-      if (body.length > 8192) req.destroy()
-    })
-    req.on("end", () => {
-      try {
-        const { token, platform } = JSON.parse(body || "{}")
-        if (typeof token !== "string" || !token) {
-          res.writeHead(400).end()
-          return
-        }
-        saveToken(token, String(platform ?? "unknown"))
-        log("info", `registered push token (${platform})`)
-        res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ ok: true }))
-      } catch {
-        res.writeHead(400).end()
+  // Only the supervised `serve` process may expose the token endpoint. Every
+  // opencode process loads user plugins into the same global dir, and whichever
+  // process binds first would win the port with that process's credentials
+  // (starving `serve` with EADDRINUSE). The supervisor marks the serve process
+  // with OPENCODE_PUSH_HOST, which also selects the interface to bind. Plugins
+  // instantiate lazily per project context, so this endpoint appears once a
+  // client (the phone) has connected and opened a session.
+  const bindHost = process.env.OPENCODE_PUSH_HOST
+  if (!bindHost) {
+    log("info", "OPENCODE_PUSH_HOST not set — push token endpoint disabled in this process")
+    return {}
+  }
+
+  // Bind the token endpoint once per process. The plugin is instantiated for
+  // every project context, so without this guard each new context would try to
+  // re-bind and log EADDRINUSE. The event hooks below are still returned for
+  // every context so pushes fire for whichever session the phone is driving.
+  if (!listenerStarted) {
+    listenerStarted = true
+    const server = http.createServer((req, res) => {
+      if (req.method !== "POST" || !req.url?.startsWith("/push/register")) {
+        res.writeHead(404).end()
+        return
       }
+      if (!authorized(req)) {
+        res.writeHead(401).end()
+        return
+      }
+      let body = ""
+      req.on("data", (c) => {
+        body += c
+        if (body.length > 8192) req.destroy()
+      })
+      req.on("end", () => {
+        try {
+          const { token, platform } = JSON.parse(body || "{}")
+          if (typeof token !== "string" || !token) {
+            res.writeHead(400).end()
+            return
+          }
+          saveToken(token, String(platform ?? "unknown"))
+          log("info", `registered push token (${platform})`)
+          res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ ok: true }))
+        } catch {
+          res.writeHead(400).end()
+        }
+      })
     })
-  })
-  server.on("error", (e) => log("warn", `token endpoint error: ${String(e)}`))
-  server.listen(cfg.port, host, () => log("info", `push token endpoint on http://${host}:${cfg.port}/push/register`))
+    server.on("error", (e) => log("warn", `token endpoint error: ${String(e)}`))
+    server.listen(cfg.port, bindHost, () =>
+      log("info", `push token endpoint on http://${bindHost}:${cfg.port}/push/register`),
+    )
+  }
 
   return {
     "tool.execute.after": async (input) => {
