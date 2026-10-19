@@ -87,6 +87,12 @@ project), so the app retries registration for a short while after connecting.
   `~/.config/opencode/mobile-push-tokens.json` and survive restarts.
 - `POST /afk/arm` / `POST /afk/disarm` / `GET /afk/state` read and write the same
   `afk/state.json` the `/afk` and `/back` commands use.
+- `POST /push/test` sends one real notification to every registered device,
+  ignoring AFK state, and reports how many were accepted (`{"ok":true,"sent":1}`).
+  The app can only confirm it handed a token over; this is how delivery itself is
+  checked.
+- `POST /push/ack` lets the app confirm it displayed a data-only push, which
+  suppresses the fallback described below.
 - On `permission.asked` / `permission.v2.asked` → "Permission needed".
 - On the `question` tool → "Question".
 - On `session.idle` after real work → "Done", carrying a sentence-aware digest of
@@ -98,10 +104,22 @@ survives server restarts. Token registration is not gated, so the device is read
 the moment you arm. Duplicate sends within 20s are suppressed.
 
 Every notification carries `category`/`sessionId` (and `permissionId` for
-permission asks) as data, which is what the app deep-links on. Tapping a push
-opens that exact session, where the prompt can be answered — inline notification
-actions are not possible for server-sent FCM notifications, which the OS renders
-from the notification payload alone.
+permission asks) as data, which is what the app deep-links on.
+
+### Permission notifications are sent twice, on purpose
+
+Approve/Reject buttons can only be attached by the app, so a permission ask is
+first sent **data-only**: FCM hands it to the app, which builds the notification
+and posts the answer back to `/permission/{id}/reply` — no app UI involved, works
+with the app killed. The one risk of data-only messages is Android withholding
+them while the phone dozes, so the sender waits 8s for `POST /push/ack` and, if
+it never comes, re-sends the same content with a notification payload that the OS
+renders regardless. You get buttons when the app can act, and a notification
+either way.
+
+Questions and Done notices skip all this and are sent as notification payloads
+from the start: they are not answered from the lock screen, so there is nothing
+to gain by trading reliability for actions.
 
 ## App side
 

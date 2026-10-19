@@ -35,6 +35,10 @@ const ALLOWED_PERSISTED_KEYS = new Map<string, string>([
   ["FIRST_OPEN_KEY", "analytics: first-open flag"],
   ["CONSENT_KEY", "telemetry consent decision"],
   ["CHATWOOT_SOURCE_KEY", "support contact id issued by Chatwoot"],
+  [
+    "PUSH_TARGET_KEY",
+    "server url + user-entered credentials the background push task answers with while the app is not running",
+  ],
 ])
 
 const SRC = path.join(import.meta.dirname, "..")

@@ -2,6 +2,7 @@ import * as Notifications from "expo-notifications"
 import * as Device from "expo-device"
 import { Platform, AppState } from "react-native"
 import { tapData, type TapData } from "./push-data"
+import { registerPushBackground } from "./push-background"
 
 // ---------------------------------------------------------------------------
 // Categories — every notification belongs to exactly one
@@ -99,6 +100,10 @@ Notifications.setNotificationHandler({
 
 export async function setup(): Promise<boolean> {
   if (!Device.isDevice) return false
+
+  // Idempotent, and also done on import: registering here means a normal launch
+  // still has the action buttons even if the entry point ever changes.
+  registerPushBackground()
 
   const { status: existing } = await Notifications.getPermissionsAsync()
   if (existing === "granted") {

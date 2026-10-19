@@ -1,6 +1,7 @@
 import fs from "node:fs"
 import http from "node:http"
 import path from "node:path"
+import { randomUUID } from "node:crypto"
 import type { IncomingMessage, Server } from "node:http"
 
 // Server-side logic for opencode-mobile-push, split out of the plugin so it can
@@ -86,23 +87,64 @@ export type PushContent = {
 
 export type PushMessage = {
   token: string
-  notification: { title: string; body: string }
+  /** Absent for a data-only message: the app is then expected to build the
+   *  notification itself, which is the only way it can carry actions. */
+  notification?: { title: string; body: string }
   data: Record<string, string>
   android: { priority: "high" }
 }
 
 export type SendPush = (token: string, message: PushMessage) => Promise<boolean>
 
+// A data-only message is handed to the app, which decides whether to display
+// it — and it can display it with Approve/Reject buttons. That is also the one
+// delivery mode Android may withhold while the phone dozes, so the sender waits
+// for the app to say "shown"; if it never does, the same content is re-sent as a
+// normal notification that the system renders no matter what. Buttons when the
+// app can act, guaranteed delivery when it cannot.
+export type AckWaiter = {
+  wait: (id: string, timeoutMs?: number) => Promise<boolean>
+  ack: (id: string) => boolean
+}
+
+export function createAckWaiter({ timeoutMs = 8_000 }: { timeoutMs?: number } = {}): AckWaiter {
+  const pending = new Map<string, (ok: boolean) => void>()
+  return {
+    wait: (id, override) =>
+      new Promise<boolean>((resolve) => {
+        const timer = setTimeout(() => {
+          pending.delete(id)
+          resolve(false)
+        }, override ?? timeoutMs)
+        pending.set(id, (ok) => {
+          clearTimeout(timer)
+          resolve(ok)
+        })
+      }),
+    ack: (id) => {
+      const resolve = pending.get(id)
+      if (!resolve) return false
+      pending.delete(id)
+      resolve(true)
+      return true
+    },
+  }
+}
+
 export function createPusher({
   store,
   tokens,
   send,
+  acks,
+  newId = () => randomUUID(),
   now = () => Date.now(),
   dedupeMs = 20_000,
 }: {
   store: AfkStore
   tokens: () => string[]
   send: SendPush
+  acks?: AckWaiter
+  newId?: () => string
   now?: () => number
   dedupeMs?: number
 }) {
@@ -122,7 +164,32 @@ export function createPusher({
       }
       if (content.sessionId) data.sessionId = content.sessionId
       if (content.permissionId) data.permissionId = content.permissionId
-      for (const token of tokens()) {
+      const devices = tokens()
+
+      // A permission is the only thing worth answering from the notification
+      // itself, and actions can only be attached by the app. Ask it to show the
+      // notification (data-only), and if it never confirms, fall back to the
+      // system-rendered one so the user is pinged regardless.
+      if (content.category === "permissions" && acks && content.permissionId) {
+        const pushId = newId()
+        const shown = acks.wait(pushId)
+        const withId = { ...data, pushId }
+        for (const token of devices) {
+          await send(token, { token, data: withId, android: { priority: "high" } })
+        }
+        if (await shown) return
+        for (const token of devices) {
+          await send(token, {
+            token,
+            notification: { title: content.title, body: content.body },
+            data: withId,
+            android: { priority: "high" },
+          })
+        }
+        return
+      }
+
+      for (const token of devices) {
         await send(token, {
           token,
           notification: { title: content.title, body: content.body },
@@ -162,16 +229,27 @@ export function createTokenStore({ file, cap = 20 }: { file: string; cap?: numbe
 
 const MAX_BODY = 8192
 
+export type TestPushResult = { ok: boolean; sent?: number; error?: string }
+
 export function createPushServer({
   store,
   tokens,
   authorized,
   onRequest,
+  sendTest,
+  onAck,
 }: {
   store: AfkStore
   tokens: TokenStore
   authorized: (req: IncomingMessage) => boolean
   onRequest?: (info: { method: string; url: string; authorized: boolean }) => void
+  /** Delivers a notification regardless of AFK state: the point is to prove
+   *  delivery works, and a user who armed nothing still needs to test their
+   *  phone. Optional, so a server can stay send-only. */
+  sendTest?: () => Promise<TestPushResult>
+  /** Called when the app confirms it displayed a data-only push, which is what
+   *  suppresses the system-rendered fallback. */
+  onAck?: (pushId: string) => void
 }): Server {
   return http.createServer((req, res) => {
     const authorized_ = authorized(req)
@@ -206,6 +284,29 @@ export function createPushServer({
       })
       return
     }
+    if (req.method === "POST" && req.url === "/push/ack") {
+      let body = ""
+      req.on("data", (chunk) => {
+        body += chunk
+        if (body.length > MAX_BODY) req.destroy()
+      })
+      req.on("end", () => {
+        try {
+          const { pushId } = JSON.parse(body || "{}")
+          if (typeof pushId !== "string" || !pushId) {
+            res.writeHead(400).end()
+            return
+          }
+          const matched = onAck?.(pushId) ?? false
+          res
+            .writeHead(200, { "Content-Type": "application/json" })
+            .end(JSON.stringify({ ok: true, matched }))
+        } catch {
+          res.writeHead(400).end()
+        }
+      })
+      return
+    }
     if (req.method === "POST" && req.url === "/afk/arm") {
       store.arm()
       res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ ok: true }))
@@ -218,6 +319,22 @@ export function createPushServer({
     }
     if (req.method === "GET" && req.url === "/afk/state") {
       res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(store.snapshot()))
+      return
+    }
+    if (req.method === "POST" && req.url === "/push/test") {
+      if (!sendTest) {
+        res.writeHead(404).end()
+        return
+      }
+      void sendTest()
+        .then((result) => {
+          res.writeHead(result.ok ? 200 : 502, { "Content-Type": "application/json" }).end(JSON.stringify(result))
+        })
+        .catch((e: unknown) => {
+          res
+            .writeHead(502, { "Content-Type": "application/json" })
+            .end(JSON.stringify({ ok: false, error: String(e) } satisfies TestPushResult))
+        })
       return
     }
     res.writeHead(404).end()

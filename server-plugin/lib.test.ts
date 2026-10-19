@@ -5,7 +5,8 @@ import os from "node:os"
 import path from "node:path"
 import type { IncomingMessage } from "node:http"
 import type { AddressInfo } from "node:net"
-import { createAfkStore, createPushServer, createPusher, createTokenStore } from "./lib.ts"
+import { createAfkStore, createAckWaiter, createPushServer, createPusher, createTokenStore } from "./lib.ts"
+import type { PushMessage } from "./lib.ts"
 
 // AFK arming is the switch that decides whether the phone gets pinged at all.
 // The app arms it by texting from the phone; these tests pin that behaviour
@@ -279,4 +280,122 @@ test("the endpoint reports every request it saw, with its auth verdict", async (
     { method: "GET", url: "/afk/state", authorized: true },
     { method: "POST", url: "/push/register", authorized: true },
   ])
+})
+
+// Handing the token over only proves the app talked to the server; it says
+// nothing about whether the phone can receive anything. A test push is the only
+// way to find out without waiting for a real prompt.
+async function startTestServer(sendTest?: () => Promise<{ ok: boolean; sent?: number; error?: string }>) {
+  const file = tempStateFile()
+  const tokens = createTokenStore({ file: `${file}.tokens.json` })
+  const server = createPushServer({ store: createAfkStore({ file }), tokens, authorized, sendTest })
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
+  const port = (server.address() as AddressInfo).port
+  return { base: `http://127.0.0.1:${port}`, close: () => new Promise<void>((r) => server.close(() => r())) }
+}
+
+test("a test push reports how many devices it reached", async () => {
+  const server = await startTestServer(async () => ({ ok: true, sent: 1 }))
+  try {
+    const res = await fetch(`${server.base}/push/test`, { method: "POST", headers: { Authorization: AUTH } })
+    assert.equal(res.status, 200)
+    assert.deepEqual(await res.json(), { ok: true, sent: 1 })
+  } finally {
+    await server.close()
+  }
+})
+
+test("a test push that delivered nothing fails loudly instead of claiming success", async () => {
+  const server = await startTestServer(async () => ({ ok: false, sent: 0, error: "no device registered" }))
+  try {
+    const res = await fetch(`${server.base}/push/test`, { method: "POST", headers: { Authorization: AUTH } })
+    assert.equal(res.status, 502)
+    assert.deepEqual(await res.json(), { ok: false, sent: 0, error: "no device registered" })
+  } finally {
+    await server.close()
+  }
+})
+
+test("a server without a sender has no test endpoint", async () => {
+  const server = await startTestServer()
+  try {
+    const res = await fetch(`${server.base}/push/test`, { method: "POST", headers: { Authorization: AUTH } })
+    assert.equal(res.status, 404)
+  } finally {
+    await server.close()
+  }
+})
+
+test("an unauthenticated caller cannot make the server send a notification", async () => {
+  let sent = false
+  const server = await startTestServer(async () => {
+    sent = true
+    return { ok: true, sent: 1 }
+  })
+  try {
+    const res = await fetch(`${server.base}/push/test`, { method: "POST" })
+    assert.equal(res.status, 401)
+    assert.equal(sent, false)
+  } finally {
+    await server.close()
+  }
+})
+
+// Approve/Reject can only be attached by the app, so a permission is delivered
+// data-only and the app builds the notification. Two things can go wrong: the
+// app never sees it (Doze) or never shows it. Either way the user must still be
+// told, so the sender waits for a confirmation and falls back to a plain push.
+function pusherHarness(timeoutMs: number) {
+  const file = tempStateFile()
+  const store = createAfkStore({ file })
+  store.arm()
+  const sent: PushMessage[] = []
+  const acks = createAckWaiter({ timeoutMs })
+  const pusher = createPusher({
+    store,
+    tokens: () => ["device-a"],
+    send: async (_token, message) => {
+      sent.push(message)
+      return true
+    },
+    acks,
+    newId: () => "push-1",
+  })
+  return { sent, acks, pusher }
+}
+
+test("a permission goes out without a notification block so the app can add actions", async () => {
+  const { sent, acks, pusher } = pusherHarness(500)
+  const delivered = pusher.push({ category: "permissions", title: "Permission", body: "rm -rf", permissionId: "perm-1" })
+  await new Promise((resolve) => setTimeout(resolve, 10))
+  assert.equal(sent.length, 1)
+  assert.equal(sent[0].notification, undefined)
+  assert.equal(sent[0].data.permissionId, "perm-1")
+  assert.equal(sent[0].data.pushId, "push-1")
+  acks.ack("push-1")
+  await delivered
+  assert.equal(sent.length, 1, "a confirmation suppresses the fallback")
+})
+
+test("a permission the app never confirms still reaches the phone", async () => {
+  const { sent, pusher } = pusherHarness(20)
+  await pusher.push({ category: "permissions", title: "Permission", body: "rm -rf", permissionId: "perm-1" })
+  assert.equal(sent.length, 2)
+  assert.equal(sent[0].notification, undefined)
+  assert.deepEqual(sent[1].notification, { title: "Permission", body: "rm -rf" })
+  assert.equal(sent[1].data.permissionId, "perm-1", "the fallback keeps the id so a tap can still act")
+})
+
+test("questions and completion notices are sent the reliable way from the start", async () => {
+  const { sent, pusher } = pusherHarness(20)
+  await pusher.push({ category: "questions", title: "Question", body: "Which file?" })
+  assert.equal(sent.length, 1)
+  assert.ok(sent[0].notification)
+})
+
+test("a permission without an id cannot be acted on, so it is not sent data-only", async () => {
+  const { sent, pusher } = pusherHarness(20)
+  await pusher.push({ category: "permissions", title: "Permission", body: "rm -rf" })
+  assert.equal(sent.length, 1)
+  assert.ok(sent[0].notification)
 })

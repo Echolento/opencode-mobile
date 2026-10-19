@@ -7,6 +7,7 @@ import { getDeviceToken } from "./notifications"
 import { log } from "./logbuffer"
 import { pluginUrlFromBase } from "./plugin-url"
 import { parseAfkState, type AfkSnapshot } from "./afk-state"
+import { clearPushTarget, setPushTarget } from "./push-target"
 
 // Push + AFK handoff to the self-hosted opencode server.
 //
@@ -61,11 +62,46 @@ const postToPlugin = (path: string, body: unknown) =>
 
 let lastSentToken: string | null = null
 
+/** The background task has no connection store to read, and the server address
+ *  must not travel inside the notification (FCM payloads cross Google's
+ *  servers), so the target it needs is kept beside the token. */
+async function rememberPushTarget(): Promise<void> {
+  try {
+    const { activeConnection: active } = useConnections.getState()
+    if (!active) {
+      await clearPushTarget()
+      return
+    }
+    const password = active.id ? await SecureStore.getItemAsync(`${PASSWORDS_PREFIX}${active.id}`) : null
+    await setPushTarget({
+      url: active.url,
+      username: active.username,
+      password,
+      directory: active.directory ?? null,
+    })
+  } catch (e) {
+    log.info("push", `could not remember push target: ${String(e)}`)
+  }
+}
+
 /** Register this device's FCM token with the active server. Best-effort and
  *  idempotent: a no-op if there is no token, no active connection, or the same
  *  token was already accepted this session. Returns true once the server
  *  acknowledges the token. */
 export async function handoffPushToken(force = false): Promise<boolean> {
+  // Several callers fire on the same connect (layout mount, app resume, token
+  // change) and each used to POST independently — a dozen identical requests in
+  // one second. They all want the same answer, so they share one attempt.
+  if (handoffInFlight) return handoffInFlight
+  handoffInFlight = doHandoff(force).finally(() => {
+    handoffInFlight = null
+  })
+  return handoffInFlight
+}
+
+let handoffInFlight: Promise<boolean> | null = null
+
+async function doHandoff(force: boolean): Promise<boolean> {
   let token: string | null = null
   try {
     token = await getDeviceToken()
@@ -81,6 +117,7 @@ export async function handoffPushToken(force = false): Promise<boolean> {
     const res = await postToPlugin("/push/register", { token, platform: Platform.OS })
     if (res?.ok) {
       lastSentToken = token
+      void rememberPushTarget()
       log.info("push", "device token registered with server")
       return true
     }

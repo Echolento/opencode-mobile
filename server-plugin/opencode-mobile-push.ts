@@ -4,7 +4,7 @@ import http from "node:http"
 import os from "node:os"
 import path from "node:path"
 import crypto from "node:crypto"
-import { createAfkStore, createPusher, createPushServer, createTokenStore, readJson, sentenceDigest } from "./lib"
+import { createAckWaiter, createAfkStore, createPusher, createPushServer, createTokenStore, readJson, sentenceDigest } from "./lib"
 import type { PushContent, SendPush } from "./lib"
 
 // opencode-mobile-push — server-side half of reliable push for OpenCode Mobile.
@@ -59,6 +59,11 @@ const TOKEN_URL = "https://oauth2.googleapis.com/token"
 const FCM_SCOPE = "https://www.googleapis.com/auth/firebase.messaging"
 const WORK_TOOLS = new Set(["write", "edit", "bash", "apply_patch"])
 const DONE_SUMMARY_CHARS = 200
+// How long the app gets to confirm it displayed a data-only permission ping
+// before the same content is re-sent as a system-rendered notification. Long
+// enough for a dozing phone to wake and reach the server, short enough that the
+// user is not left waiting when it cannot.
+const ACK_TIMEOUT_MS = 8_000
 
 type Config = { project: string; keyFile: string; port: number }
 
@@ -118,9 +123,14 @@ function makeSender(cfg: Config, log: (level: "info" | "warn", message: string) 
         body: JSON.stringify({
           message: {
             token,
-            notification: { title: message.notification.title, body: message.notification.body },
+            // Omitted for data-only messages: FCM then hands the payload to the
+            // app instead of rendering it, which is what allows actions.
+            ...(message.notification ? { notification: message.notification } : {}),
             data: message.data,
-            android: { priority: "high", notification: { channel_id: "prompts" } },
+            android: {
+              priority: "high",
+              ...(message.notification ? { notification: { channel_id: "prompts" } } : {}),
+            },
           },
         }),
       })
@@ -180,10 +190,13 @@ export const OpenCodeMobilePushPlugin: Plugin = async ({ client, directory, serv
 
   const afk = createAfkStore({ file: AFK_STATE_FILE })
   const tokens = createTokenStore({ file: TOKENS_FILE })
+  const send = makeSender(cfg, log)
+  const acks = createAckWaiter({ timeoutMs: ACK_TIMEOUT_MS })
   const pusher = createPusher({
     store: afk,
     tokens: () => tokens.list().map((entry) => entry.token),
-    send: makeSender(cfg, log),
+    send,
+    acks,
   })
   const push = (content: PushContent) => pusher.push(content)
 
@@ -208,6 +221,31 @@ export const OpenCodeMobilePushPlugin: Plugin = async ({ client, directory, serv
       // Never the body: a registration body *is* a device credential.
       onRequest: ({ method, url, authorized: ok }) =>
         debug(`request ${method} ${url} auth=${ok ? "ok" : "REJECTED"}`),
+      onAck: (pushId) => {
+        const matched = acks.ack(pushId)
+        debug(`ack ${pushId} matched=${matched}`)
+        return matched
+      },
+      // Delivery is the one link the app cannot verify for itself: it only sees
+      // that it handed a token over. This sends one real notification so the
+      // phone, not just the server, can confirm the chain end to end.
+      sendTest: async () => {
+        const deviceTokens = tokens.list().map((entry) => entry.token)
+        if (!deviceTokens.length) return { ok: false, sent: 0, error: "no device registered" }
+        const body = "Push is working. This notification came from your OpenCode server."
+        let sent = 0
+        for (const token of deviceTokens) {
+          const ok = await send(token, {
+            token,
+            notification: { title: "OpenCode test", body },
+            data: { category: "test", title: "OpenCode test", body },
+            android: { priority: "high" },
+          })
+          if (ok) sent++
+        }
+        if (!sent) return { ok: false, sent, error: "FCM rejected every token (expired or wrong project)" }
+        return { ok: true, sent }
+      },
     })
     server.on("error", (e) => {
       log("warn", `push endpoint error: ${String(e)}`)
