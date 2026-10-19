@@ -15,11 +15,22 @@ battery cost**.
 
 ## Install
 
-Copy `opencode-mobile-push.ts` into your opencode plugins directory:
+Build the plugin and copy **the built file** into your opencode plugins
+directory. opencode loads a user plugin as a single module and does not resolve
+relative imports between plugin files, so `opencode-mobile-push.ts` (which
+imports `./lib`) cannot be copied directly — copying the source silently yields a
+plugin that never binds its endpoint.
 
 ```
-~/.config/opencode/plugins/opencode-mobile-push.ts
+npm run build:plugin    # inlines lib.ts -> server-plugin/dist/opencode-mobile-push.ts
 ```
+
+```
+~/.config/opencode/plugins/opencode-mobile-push.ts   # the built file
+```
+
+`lib.ts` stays the source of truth and is unit-tested on its own; the build step
+only inlines it. Re-run the build and re-copy after changing either file.
 
 ## Configure
 
@@ -28,7 +39,7 @@ Copy `opencode-mobile-push.ts` into your opencode plugins directory:
 ```json
 {
   "project": "your-firebase-project-id",
-  "keyFile": "~/.config/your-firebase/key.json",
+  "keyFile": "~/.config/opencode/mobile-push-key.json",
   "port": 4097
 }
 ```
@@ -38,7 +49,17 @@ Copy `opencode-mobile-push.ts` into your opencode plugins directory:
 - `port` — the plugin listens for token registrations on this port, on the same
   host as the opencode server.
 
-Env overrides: `OPENCODE_PUSH_PROJECT`, `OPENCODE_PUSH_KEY_FILE`, `OPENCODE_PUSH_PORT`.
+Config JSON may have a UTF-8 BOM (PowerShell's `Set-Content -Encoding utf8` adds
+one) — it is stripped before parsing, so hand-edits on Windows cannot silently
+disable push.
+
+Env overrides: `OPENCODE_PUSH_PROJECT`, `OPENCODE_PUSH_KEY_FILE`,
+`OPENCODE_PUSH_PORT`, `OPENCODE_PUSH_CONFIG_FILE`, `OPENCODE_PUSH_TOKENS_FILE`,
+`OPENCODE_AFK_STATE_FILE`.
+
+Set `OPENCODE_PUSH_DEBUG=1` to append an init trace (including the resolved
+config and the bind result) to `%TEMP%/opencode-mobile-push.log`; plugin logging
+inside opencode is otherwise easy to lose.
 
 ### `OPENCODE_PUSH_HOST` (required)
 
@@ -61,12 +82,26 @@ project), so the app retries registration for a short while after connecting.
 
 ## What it does
 
-- Serves `POST /push/register` (HTTP Basic, the same `OPENCODE_SERVER_PASSWORD`
-  the server uses) to collect device tokens; stores them in
-  `~/.config/opencode/mobile-push-tokens.json`.
+- `POST /push/register` (HTTP Basic, the same `OPENCODE_SERVER_PASSWORD` the
+  server uses) collects device tokens; they are stored in
+  `~/.config/opencode/mobile-push-tokens.json` and survive restarts.
+- `POST /afk/arm` / `POST /afk/disarm` / `GET /afk/state` read and write the same
+  `afk/state.json` the `/afk` and `/back` commands use.
 - On `permission.asked` / `permission.v2.asked` → "Permission needed".
 - On the `question` tool → "Question".
-- On `session.idle` after real work → "Done".
+- On `session.idle` after real work → "Done", carrying a sentence-aware digest of
+  the agent's closing message (whole sentences only, no model call).
+
+All sends fire **only while AFK is armed**; `/back` (laptop) or `POST
+/afk/disarm` (phone) silences them. Arming has no expiry — it is intent, and it
+survives server restarts. Token registration is not gated, so the device is ready
+the moment you arm. Duplicate sends within 20s are suppressed.
+
+Every notification carries `category`/`sessionId` (and `permissionId` for
+permission asks) as data, which is what the app deep-links on. Tapping a push
+opens that exact session, where the prompt can be answered — inline notification
+actions are not possible for server-sent FCM notifications, which the OS renders
+from the notification payload alone.
 
 ## App side
 

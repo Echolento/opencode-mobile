@@ -1,9 +1,11 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import fs from "node:fs"
+import http from "node:http"
 import os from "node:os"
 import path from "node:path"
-import http from "node:http"
 import crypto from "node:crypto"
+import { createAfkStore, createPusher, createPushServer, createTokenStore, readJson, sentenceDigest } from "./lib"
+import type { PushContent, SendPush } from "./lib"
 
 // opencode-mobile-push — server-side half of reliable push for OpenCode Mobile.
 //
@@ -12,14 +14,14 @@ import crypto from "node:crypto"
 // Instead the app hands its FCM token to this plugin, and the plugin pushes
 // from the server on the events that matter — with the app cold/killed.
 //
-// It registers device tokens over a tiny authenticated HTTP endpoint on the
-// same host as the opencode server, and reuses the FCM service-account key
-// already present on this machine to send.
+// Pings fire ONLY while /afk is armed (shared afk/state.json). The phone arms it
+// by texting (POST /afk/arm); /back on the laptop, or POST /afk/disarm from the
+// phone, silences it again.
 //
 // Config: ~/.config/opencode/mobile-push.json
 //   {
 //     "project": "your-firebase-project-id",
-//     "keyFile": "~/.config/your-firebase/key.json",
+//     "keyFile": "~/.config/opencode/mobile-push-key.json",
 //     "port": 4097
 //   }
 // Env overrides: OPENCODE_PUSH_PROJECT, OPENCODE_PUSH_KEY_FILE, OPENCODE_PUSH_PORT.
@@ -27,74 +29,71 @@ import crypto from "node:crypto"
 // starts in the process given it, so the supervisor's `serve` binds and other
 // opencode processes stay silent. It is also the interface to bind.
 //
-// Registering a token (the app does this automatically):
-//   POST http://<host>:<port>/push/register   (HTTP Basic: <username>:<server password>)
-//   { "token": "<fcm token>", "platform": "android" }
+// Endpoints (all HTTP Basic: <username>:<server password>):
+//   POST /push/register  { "token", "platform" }   register a device
+//   POST /afk/arm                                  user is away: start pinging
+//   POST /afk/disarm                               user is back: stop pinging
+//   GET  /afk/state                                { armed, armedAt }
 
-const CONFIG_FILE = path.join(os.homedir(), ".config", "opencode", "mobile-push.json")
-const TOKENS_FILE = path.join(os.homedir(), ".config", "opencode", "mobile-push-tokens.json")
+const CONFIG_FILE =
+  process.env.OPENCODE_PUSH_CONFIG_FILE ?? path.join(os.homedir(), ".config", "opencode", "mobile-push.json")
+const TOKENS_FILE =
+  process.env.OPENCODE_PUSH_TOKENS_FILE ?? path.join(os.homedir(), ".config", "opencode", "mobile-push-tokens.json")
+// Shared with the /afk and /back commands.
+const AFK_STATE_FILE =
+  process.env.OPENCODE_AFK_STATE_FILE ?? path.join(os.homedir(), ".config", "opencode", "afk", "state.json")
+
+// Plugin init happens inside opencode, where plugin logging is easy to lose, so
+// a silently failing plugin looks identical to a plugin that was never loaded.
+// OPENCODE_PUSH_DEBUG=1 appends a trace to this file instead.
+const DEBUG_FILE = process.env.OPENCODE_PUSH_DEBUG_FILE ?? path.join(os.tmpdir(), "opencode-mobile-push.log")
+const debug = (message: string) => {
+  if (!process.env.OPENCODE_PUSH_DEBUG) return
+  try {
+    fs.appendFileSync(DEBUG_FILE, `${new Date().toISOString()} ${message}\n`)
+  } catch {}
+}
+debug(`module loaded (pid ${process.pid})`)
+
 const TOKEN_URL = "https://oauth2.googleapis.com/token"
 const FCM_SCOPE = "https://www.googleapis.com/auth/firebase.messaging"
 const WORK_TOOLS = new Set(["write", "edit", "bash", "apply_patch"])
-const DEDUPE_MS = 20_000
+const DONE_SUMMARY_CHARS = 200
 
 type Config = { project: string; keyFile: string; port: number }
-type DeviceToken = { token: string; platform: string; added: number }
 
-const b64url = (b: Buffer | Uint8Array) => Buffer.from(b).toString("base64url")
-let cached: { token: string; exp: number } | null = null
-const lastSent = new Map<string, number>()
-const didWork = new Set<string>()
-let listenerStarted = false
-
-function expand(p: string): string {
-  return p.startsWith("~/") ? path.join(os.homedir(), p.slice(2)) : p
-}
+const expand = (p: string) => (p.startsWith("~/") ? path.join(os.homedir(), p.slice(2)) : p)
 
 function loadConfig(): Config | null {
   let project = process.env.OPENCODE_PUSH_PROJECT ?? ""
   let keyFile = process.env.OPENCODE_PUSH_KEY_FILE ?? ""
   let port = Number(process.env.OPENCODE_PUSH_PORT ?? 4097)
-  try {
-    const c = JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8"))
+  const c = readJson<{ project?: string; keyFile?: string; port?: number }>(CONFIG_FILE)
+  if (c) {
     project = c.project ?? project
     keyFile = c.keyFile ? expand(c.keyFile) : keyFile
     port = Number(c.port ?? port)
-  } catch {
-    // env-only fallback
   }
   if (!project || !keyFile) return null
   return { project, keyFile, port }
 }
 
-function readTokens(): DeviceToken[] {
-  try {
-    const arr = JSON.parse(fs.readFileSync(TOKENS_FILE, "utf8"))
-    return Array.isArray(arr) ? arr : []
-  } catch {
-    return []
-  }
-}
-
-function saveToken(token: string, platform: string) {
-  const tokens = readTokens().filter((t) => t.token !== token)
-  tokens.push({ token, platform, added: Date.now() })
-  fs.writeFileSync(TOKENS_FILE, JSON.stringify(tokens.slice(-20), null, 2))
-}
+let cachedToken: { token: string; exp: number } | null = null
 
 async function accessToken(keyFile: string): Promise<string> {
-  if (cached && cached.exp > Date.now() + 60_000) return cached.token
-  const key = JSON.parse(fs.readFileSync(keyFile, "utf8"))
+  if (cachedToken && cachedToken.exp > Date.now() + 60_000) return cachedToken.token
+  const key = readJson<{ private_key_id: string; client_email: string; private_key: string }>(keyFile)
+  if (!key) throw new Error(`service account key unreadable: ${keyFile}`)
   const now = Math.floor(Date.now() / 1000)
-  const header = b64url(Buffer.from(JSON.stringify({ alg: "RS256", typ: "JWT", kid: key.private_key_id })))
-  const payload = b64url(
-    Buffer.from(
-      JSON.stringify({ iss: key.client_email, scope: FCM_SCOPE, aud: TOKEN_URL, iat: now, exp: now + 3600 }),
-    ),
+  const b64 = (b: Buffer | Uint8Array) => Buffer.from(b).toString("base64url")
+  const header = b64(Buffer.from(JSON.stringify({ alg: "RS256", typ: "JWT", kid: key.private_key_id })))
+  const payload = b64(
+    Buffer.from(JSON.stringify({ iss: key.client_email, scope: FCM_SCOPE, aud: TOKEN_URL, iat: now, exp: now + 3600 })),
   )
   const signer = crypto.createSign("RSA-SHA256")
   signer.update(`${header}.${payload}`)
-  const jwt = `${header}.${payload}.${b64url(signer.sign(key.private_key))}`
+  const jwt = `${header}.${payload}.${b64(signer.sign(key.private_key))}`
+
   const res = await fetch(TOKEN_URL, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -102,38 +101,37 @@ async function accessToken(keyFile: string): Promise<string> {
   })
   if (!res.ok) throw new Error(`token exchange ${res.status}`)
   const data = (await res.json()) as { access_token: string; expires_in: number }
-  cached = { token: data.access_token, exp: Date.now() + data.expires_in * 1000 }
-  return cached.token
+  cachedToken = { token: data.access_token, exp: Date.now() + data.expires_in * 1000 }
+  return cachedToken.token
 }
 
-async function sendTo(token: string, cfg: Config, kind: string, title: string, body: string) {
-  const at = await accessToken(cfg.keyFile)
-  const res = await fetch(`https://fcm.googleapis.com/v1/projects/${cfg.project}/messages:send`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${at}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      message: {
-        token,
-        notification: { title, body },
-        data: { kind, title, body },
-        android: { priority: "high" },
-      },
-    }),
-  })
-  return res.ok
-}
-
-async function push(cfg: Config | null, kind: string, title: string, body: string) {
-  if (!cfg) return
-  const dkey = `${kind}:${body}`.slice(0, 200)
-  const prev = lastSent.get(dkey) ?? 0
-  if (Date.now() - prev < DEDUPE_MS) return
-  lastSent.set(dkey, Date.now())
-  for (const t of readTokens()) {
+// FCM delivery: data-only keys mirror the app's notification contract
+// (category/sessionId/permissionId) so a tap deep-links and a permission can be
+// answered inline.
+function makeSender(cfg: Config, log: (level: "info" | "warn", message: string) => void): SendPush {
+  return async (token, message) => {
     try {
-      await sendTo(t.token, cfg, kind, title, body)
-    } catch {
-      // best effort per device
+      const at = await accessToken(cfg.keyFile)
+      const res = await fetch(`https://fcm.googleapis.com/v1/projects/${cfg.project}/messages:send`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${at}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: {
+            token,
+            notification: { title: message.notification.title, body: message.notification.body },
+            data: message.data,
+            android: { priority: "high", notification: { channel_id: "prompts" } },
+          },
+        }),
+      })
+      if (!res.ok) {
+        log("warn", `FCM send failed: ${res.status}`)
+        return false
+      }
+      return true
+    } catch (e) {
+      log("warn", `FCM send error: ${String(e)}`)
+      return false
     }
   }
 }
@@ -145,23 +143,26 @@ function authorized(req: http.IncomingMessage): boolean {
   if (!header?.startsWith("Basic ")) return false
   try {
     const decoded = Buffer.from(header.slice(6), "base64").toString("utf8")
-    const pass = decoded.slice(decoded.indexOf(":") + 1)
-    return pass === pw
+    return decoded.slice(decoded.indexOf(":") + 1) === pw
   } catch {
     return false
   }
 }
 
-const trim = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1).trimEnd()}…` : s)
+const didWork = new Set<string>()
+let listenerStarted = false
 
-export const OpenCodeMobilePushPlugin: Plugin = async ({ client, directory }) => {
+export const OpenCodeMobilePushPlugin: Plugin = async ({ client, directory, serverUrl }) => {
+  // Never let a logging failure take down plugin init: a throwing client call
+  // here would abort loading the whole plugin (and with it the push endpoint).
   const log = (level: "info" | "warn", message: string) => {
     try {
-      void client.app.log({ body: { service: "opencode-mobile-push", level, message } })
-    } catch {
-      console.log(`[opencode-mobile-push] ${level}: ${message}`)
-    }
+      void Promise.resolve(
+        client.app?.log({ body: { service: "opencode-mobile-push", level, message } }),
+      ).catch(() => {})
+    } catch {}
   }
+  const auth = { user: process.env.OPENCODE_SERVER_USERNAME || "opencode", password: process.env.OPENCODE_SERVER_PASSWORD }
   const project = (() => {
     try {
       return path.basename(directory || process.cwd())
@@ -171,63 +172,76 @@ export const OpenCodeMobilePushPlugin: Plugin = async ({ client, directory }) =>
   })()
 
   const cfg = loadConfig()
+  debug(`factory start host=${process.env.OPENCODE_PUSH_HOST ?? "<unset>"} config=${cfg ? "ok" : "missing"}`)
   if (!cfg) {
-    log("warn", "no mobile-push.json (project/keyFile) — token endpoint disabled")
+    log("warn", "no mobile-push.json (project/keyFile) — push disabled")
     return {}
   }
 
-  // Only the supervised `serve` process may expose the token endpoint. Every
-  // opencode process loads user plugins into the same global dir, and whichever
-  // process binds first would win the port with that process's credentials
-  // (starving `serve` with EADDRINUSE). The supervisor marks the serve process
-  // with OPENCODE_PUSH_HOST, which also selects the interface to bind. Plugins
-  // instantiate lazily per project context, so this endpoint appears once a
-  // client (the phone) has connected and opened a session.
+  const afk = createAfkStore({ file: AFK_STATE_FILE })
+  const tokens = createTokenStore({ file: TOKENS_FILE })
+  const pusher = createPusher({
+    store: afk,
+    tokens: () => tokens.list().map((entry) => entry.token),
+    send: makeSender(cfg, log),
+  })
+  const push = (content: PushContent) => pusher.push(content)
+
+  // Only the supervised `serve` process may expose the endpoint. Every opencode
+  // process loads user plugins into the same global dir, and whichever process
+  // binds first would win the port with that process's credentials (starving
+  // `serve` with EADDRINUSE). The supervisor marks the serve process with
+  // OPENCODE_PUSH_HOST, which also selects the interface to bind. Plugins
+  // instantiate lazily per project context, so this appears once a client (the
+  // phone) has connected and opened a session.
   const bindHost = process.env.OPENCODE_PUSH_HOST
   if (!bindHost) {
-    log("info", "OPENCODE_PUSH_HOST not set — push token endpoint disabled in this process")
+    log("info", "OPENCODE_PUSH_HOST not set — push endpoint disabled in this process")
     return {}
   }
-
-  // Bind the token endpoint once per process. The plugin is instantiated for
-  // every project context, so without this guard each new context would try to
-  // re-bind and log EADDRINUSE. The event hooks below are still returned for
-  // every context so pushes fire for whichever session the phone is driving.
   if (!listenerStarted) {
     listenerStarted = true
-    const server = http.createServer((req, res) => {
-      if (req.method !== "POST" || !req.url?.startsWith("/push/register")) {
-        res.writeHead(404).end()
-        return
-      }
-      if (!authorized(req)) {
-        res.writeHead(401).end()
-        return
-      }
-      let body = ""
-      req.on("data", (c) => {
-        body += c
-        if (body.length > 8192) req.destroy()
-      })
-      req.on("end", () => {
-        try {
-          const { token, platform } = JSON.parse(body || "{}")
-          if (typeof token !== "string" || !token) {
-            res.writeHead(400).end()
-            return
-          }
-          saveToken(token, String(platform ?? "unknown"))
-          log("info", `registered push token (${platform})`)
-          res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ ok: true }))
-        } catch {
-          res.writeHead(400).end()
-        }
-      })
+    const server = createPushServer({ store: afk, tokens, authorized })
+    server.on("error", (e) => {
+      log("warn", `push endpoint error: ${String(e)}`)
+      debug(`listen error: ${String(e)}`)
     })
-    server.on("error", (e) => log("warn", `token endpoint error: ${String(e)}`))
-    server.listen(cfg.port, bindHost, () =>
-      log("info", `push token endpoint on http://${bindHost}:${cfg.port}/push/register`),
-    )
+    debug(`listening on ${bindHost}:${cfg.port}`)
+    server.listen(cfg.port, bindHost, () => {
+      log("info", `push endpoint on http://${bindHost}:${cfg.port} (register, afk/arm, afk/disarm, afk/state)`)
+      debug(`bound on ${bindHost}:${cfg.port}`)
+    })
+  }
+
+  // The agent's closing message makes the Done ping worth reading from a lock
+  // screen; the digest keeps it to complete thoughts.
+  const lastAssistantText = async (sessionID: string): Promise<string> => {
+    if (!auth.password || !serverUrl) return ""
+    try {
+      const res = await fetch(
+        new URL(`/session/${sessionID}/message?directory=${encodeURIComponent(directory)}`, serverUrl),
+        {
+          headers: {
+            Authorization: `Basic ${Buffer.from(`${auth.user}:${auth.password}`).toString("base64")}`,
+          },
+          signal: AbortSignal.timeout(5_000),
+        },
+      )
+      if (!res.ok) return ""
+      const msgs = (await res.json()) as { info?: { role?: string }; parts?: { type?: string; text?: string }[] }[]
+      if (!Array.isArray(msgs)) return ""
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        const m = msgs[i]
+        if (m?.info?.role !== "assistant") continue
+        const text = (m.parts ?? [])
+          .filter((part) => part?.type === "text" && typeof part.text === "string")
+          .map((part) => part.text)
+          .join(" ")
+          .trim()
+        if (text) return text
+      }
+    } catch {}
+    return ""
   }
 
   return {
@@ -238,10 +252,15 @@ export const OpenCodeMobilePushPlugin: Plugin = async ({ client, directory }) =>
     "tool.execute.before": async (input, output) => {
       try {
         if (input?.tool !== "question") return
-        const questions = (output?.args as { questions?: Array<{ question?: string }> })?.questions
+        const questions = (output?.args as { questions?: Array<{ question?: string }> } | undefined)?.questions
         if (!Array.isArray(questions) || questions.length === 0) return
-        const body = trim(questions.map((q) => String(q?.question ?? "")).join(" | "), 300)
-        await push(cfg, "question", `Question · ${project}`, body || "The agent needs your input")
+        const body = questions.map((q) => String(q?.question ?? "")).join(" | ")
+        await push({
+          category: "questions",
+          title: `Question · ${project}`,
+          body: sentenceDigest(body, { maxChars: 200 }) || "The agent needs your input",
+          sessionId: input.sessionID,
+        })
       } catch (e) {
         log("warn", `question hook error: ${String(e)}`)
       }
@@ -257,15 +276,27 @@ export const OpenCodeMobilePushPlugin: Plugin = async ({ client, directory }) =>
             type === "permission.v2.asked" ? String(props.action ?? "permission") : String(props.permission ?? "permission")
           const patterns = (type === "permission.v2.asked" ? props.resources : props.patterns) as unknown
           const detail = Array.isArray(patterns) ? patterns.map(String).join(", ") : ""
-          const body = trim([label, detail].filter(Boolean).join(": "), 300) || label
-          await push(cfg, "permission", `Permission needed · ${project}`, body)
+          const sessionId = String(props.sessionID ?? "")
+          await push({
+            category: "permissions",
+            title: `Permission needed · ${project}`,
+            body: [label, detail].filter(Boolean).join(": ") || label,
+            ...(sessionId ? { sessionId } : {}),
+            permissionId: String(props.id ?? ""),
+          })
           return
         }
 
         if (type === "session.idle") {
           const sessionID = String(props.sessionID ?? "")
           if (!sessionID || !didWork.delete(sessionID)) return
-          await push(cfg, "done", `Done · ${project}`, "opencode finished a turn")
+          const summary = await lastAssistantText(sessionID)
+          await push({
+            category: "completed",
+            title: `Done · ${project}`,
+            body: sentenceDigest(summary, { maxChars: DONE_SUMMARY_CHARS }) || "opencode finished a turn",
+            sessionId: sessionID,
+          })
         }
       } catch (e) {
         log("warn", `event hook error: ${String(e)}`)

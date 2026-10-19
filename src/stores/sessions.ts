@@ -7,6 +7,8 @@ import { AnalyticsEvent, track } from "../lib/analytics"
 import { extractPromptFromParts, type PromptFromParts } from "../lib/prompt-from-parts"
 import { mergeIncomingMessage } from "../lib/message-merge"
 import { isColdSessionLoad, isLiveEventForSession } from "../lib/session-load-reconcile"
+import { armAfk } from "../lib/push"
+import { useAfk } from "./afk"
 
 // Helper to convert API response to our internal format
 function parseMessages(response: MessageWithParts[]): { messages: Message[]; parts: Record<string, Part[]> } {
@@ -317,6 +319,12 @@ export const useSessions = create<SessionsState>((set, get) => ({
           promptParts.push({ type: "file", mime: f.mime, url, filename: f.filename })
         }
       }
+
+      // Sending from the phone is the signal that the user is away (and not at
+      // the laptop): arm pings so this turn's question/permission/done notices
+      // reach the phone even when it is backgrounded. Fire-and-forget — it must
+      // never delay or fail the prompt itself.
+      void armAfk().then(() => useAfk.getState().refresh())
 
       // Await submission (POST to /prompt_async resolves fast, well before the
       // streamed response) so a failure here can propagate to the caller — SSE

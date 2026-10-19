@@ -31,3 +31,4 @@ android/app/src/main/assets/index.android.bundle
 artifacts/screenshots/
 positive-S*.png
 negative-S*.png
+server-plugin/dist/

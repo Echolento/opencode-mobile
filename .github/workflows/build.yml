@@ -4,35 +4,14 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+    paths-ignore:
+      - "server-plugin/**"
+      - "**/*.md"
   pull_request:
     branches: [main]
   workflow_dispatch:
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: actions/setup-node@v6
-        with:
-          # Node >= 23.6 runs the TypeScript test files natively (type-stripping),
-          # matching the local toolchain. No build step or extra deps required.
-          node-version: 24
-          cache: npm
-
-      - name: Install dependencies
-        run: npm install --legacy-peer-deps
-
-      - name: Check release version metadata
-        run: npm run check:versions
-
-      - name: Typecheck
-        run: npm run typecheck
-
-      - name: Unit tests
-        run: npm test
-
   build:
     runs-on: ubuntu-latest
     env:

@@ -28,6 +28,7 @@ import type { Session, Project } from "../../src/lib/sdk"
 import { DirectorySwitcher, DirectoryBrowserSheet } from "../../src/components/chat"
 import { groupByDirectory } from "../../src/lib/session-grouping"
 import { UpdateBanner } from "../../src/components/UpdateBanner"
+import { AfkBanner } from "../../src/components/AfkBanner"
 import { nameOf } from "../../src/lib/path-utils"
 import { SETUP_GUIDE_URL } from "../../src/lib/links"
 
@@ -550,6 +551,8 @@ export default function SessionsScreen() {
       )}
 
       <UpdateBanner isDark={isDark} />
+
+      <AfkBanner isDark={isDark} />
 
       <FlatList
         data={rows}
