@@ -1,6 +1,7 @@
 import * as Notifications from "expo-notifications"
 import * as Device from "expo-device"
 import { Platform, AppState } from "react-native"
+import { tapData, type TapData } from "./push-data"
 
 // ---------------------------------------------------------------------------
 // Categories — every notification belongs to exactly one
@@ -187,14 +188,44 @@ export async function send(payload: Payload) {
 // Tap handler — returns cleanup function
 // ---------------------------------------------------------------------------
 
-export function onTap(handler: (data: NotificationData) => void) {
-  const subscription = Notifications.addNotificationResponseReceivedListener((response) => {
-    const raw = response.notification.request.content.data
-    const data = raw as unknown as NotificationData | undefined
-    if (!data) return
-    if (data.sessionId || data.category === "connection") {
-      handler(data)
+// A tap can be delivered twice on a cold start (the response that launched the
+// app, then the same one through the listener), and acting twice means pushing
+// the same route twice. Notification identifiers are unique per notification,
+// so remember the few we have acted on rather than trusting a single source.
+const handledTaps = new Set<string>()
+const HANDLED_TAP_MEMORY = 20
+
+function handleResponse(response: Notifications.NotificationResponse, handler: (data: TapData) => void) {
+  const id = response?.notification?.request?.identifier
+  if (id) {
+    if (handledTaps.has(id)) return
+    handledTaps.add(id)
+    if (handledTaps.size > HANDLED_TAP_MEMORY) {
+      const oldest = handledTaps.values().next().value
+      if (oldest) handledTaps.delete(oldest)
     }
+  }
+
+  // tapData also decides whether this tap is actionable at all: a push that
+  // names no session is ignored rather than navigating on a guess.
+  const data = tapData(response?.notification?.request?.content?.data)
+  if (data) handler(data)
+}
+
+export function onTap(handler: (data: TapData) => void) {
+  const subscription = Notifications.addNotificationResponseReceivedListener((response) => {
+    handleResponse(response, handler)
   })
+
+  // A tap that *launched* the app is delivered before this listener can exist
+  // (it is registered on first render), so the cold-start response has to be
+  // drained explicitly — otherwise tapping a push while the app is killed opens
+  // the app on the wrong screen, which is the common case for server pushes.
+  void Notifications.getLastNotificationResponseAsync()
+    .then((response) => {
+      if (response) handleResponse(response, handler)
+    })
+    .catch(() => undefined)
+
   return () => subscription.remove()
 }

@@ -201,7 +201,14 @@ export const OpenCodeMobilePushPlugin: Plugin = async ({ client, directory, serv
   }
   if (!listenerStarted) {
     listenerStarted = true
-    const server = createPushServer({ store: afk, tokens, authorized })
+    const server = createPushServer({
+      store: afk,
+      tokens,
+      authorized,
+      // Never the body: a registration body *is* a device credential.
+      onRequest: ({ method, url, authorized: ok }) =>
+        debug(`request ${method} ${url} auth=${ok ? "ok" : "REJECTED"}`),
+    })
     server.on("error", (e) => {
       log("warn", `push endpoint error: ${String(e)}`)
       debug(`listen error: ${String(e)}`)

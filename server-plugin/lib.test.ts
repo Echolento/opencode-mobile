@@ -247,3 +247,36 @@ test("a BOM in the token file does not lose registered devices", () => {
     ["device-a"],
   )
 })
+
+// "The phone never registers" has several indistinguishable causes (app too old
+// to register, notifications denied, wrong password, unreachable endpoint). The
+// server can only say which one it is if it reports what actually reached it.
+test("the endpoint reports every request it saw, with its auth verdict", async () => {
+  const file = tempStateFile()
+  const seen: Array<{ method: string; url: string; authorized: boolean }> = []
+  const server = createPushServer({
+    store: createAfkStore({ file }),
+    tokens: createTokenStore({ file: `${file}.tokens.json` }),
+    authorized,
+    onRequest: (info) => seen.push(info),
+  })
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
+  const port = (server.address() as AddressInfo).port
+  try {
+    await fetch(`http://127.0.0.1:${port}/afk/state`)
+    await fetch(`http://127.0.0.1:${port}/afk/state`, { headers: { Authorization: AUTH } })
+    await fetch(`http://127.0.0.1:${port}/push/register`, {
+      method: "POST",
+      headers: { Authorization: AUTH, "Content-Type": "application/json" },
+      body: JSON.stringify({ token: "device-a", platform: "android" }),
+    })
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  }
+
+  assert.deepEqual(seen, [
+    { method: "GET", url: "/afk/state", authorized: false },
+    { method: "GET", url: "/afk/state", authorized: true },
+    { method: "POST", url: "/push/register", authorized: true },
+  ])
+})

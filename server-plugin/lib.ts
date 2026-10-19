@@ -166,13 +166,22 @@ export function createPushServer({
   store,
   tokens,
   authorized,
+  onRequest,
 }: {
   store: AfkStore
   tokens: TokenStore
   authorized: (req: IncomingMessage) => boolean
+  onRequest?: (info: { method: string; url: string; authorized: boolean }) => void
 }): Server {
   return http.createServer((req, res) => {
-    if (!authorized(req)) {
+    const authorized_ = authorized(req)
+    // Reported before the verdict is acted on: a rejected request is the
+    // interesting one (the phone reached us but its credentials did not match),
+    // and it is otherwise completely invisible.
+    try {
+      onRequest?.({ method: String(req.method ?? ""), url: String(req.url ?? ""), authorized: authorized_ })
+    } catch {}
+    if (!authorized_) {
       res.writeHead(401).end()
       return
     }
