@@ -52,6 +52,15 @@ export function createAfkStore({ file }: { file: string }): AfkStore {
   }
 }
 
+// Hard cut with an ellipsis, for bodies that are a label rather than prose
+// ("bash: npm install", "Q1: ..."): there is no sentence to preserve, only a
+// width to respect so the text survives a lock screen. Skye trimmed pings this
+// way and they never read as clipped mid-thought.
+export function trim(text: string, maxChars = 350): string {
+  const clean = text.replace(/\s+/g, " ").trim()
+  return clean.length > maxChars ? `${clean.slice(0, maxChars - 1).trimEnd()}…` : clean
+}
+
 // Notification bodies must read as complete thoughts: prefer whole sentences
 // up to the character budget, and if even the first sentence is too long, cut
 // at a word boundary rather than mid-word.

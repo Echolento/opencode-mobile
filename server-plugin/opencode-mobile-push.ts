@@ -4,15 +4,15 @@ import http from "node:http"
 import os from "node:os"
 import path from "node:path"
 import crypto from "node:crypto"
-import { createAckWaiter, createAfkStore, createPusher, createPushServer, createTokenStore, readJson, sentenceDigest } from "./lib"
+import { createAckWaiter, createAfkStore, createPusher, createPushServer, createTokenStore, readJson, sentenceDigest, trim } from "./lib"
 import type { PushContent, SendPush } from "./lib"
 
-// opencode-mobile-push â€” server-side half of reliable push for OpenCode Mobile.
+// opencode-mobile-push — server-side half of reliable push for OpenCode Mobile.
 //
 // Why: the app cannot be relied on to hold a background SSE socket (Android
 // suspends it), so it never gets a chance to schedule its local notifications.
 // Instead the app hands its FCM token to this plugin, and the plugin pushes
-// from the server on the events that matter â€” with the app cold/killed.
+// from the server on the events that matter — with the app cold/killed.
 //
 // Pings fire ONLY while /afk is armed (shared afk/state.json). The phone arms it
 // by texting (POST /afk/arm); /back on the laptop, or POST /afk/disarm from the
@@ -25,7 +25,7 @@ import type { PushContent, SendPush } from "./lib"
 //     "port": 4097
 //   }
 // Env overrides: OPENCODE_PUSH_PROJECT, OPENCODE_PUSH_KEY_FILE, OPENCODE_PUSH_PORT.
-// OPENCODE_PUSH_HOST (e.g. the tailnet IP) is REQUIRED â€” the endpoint only
+// OPENCODE_PUSH_HOST (e.g. the tailnet IP) is REQUIRED — the endpoint only
 // starts in the process given it, so the supervisor's `serve` binds and other
 // opencode processes stay silent. It is also the interface to bind.
 //
@@ -73,6 +73,15 @@ const PERMISSION_CONFIRM_MS = 1_500
 // How often the pending list is re-read while the phone is armed. Cheap (one
 // request to the local server) and it is what makes a missed event harmless.
 const PERMISSION_POLL_MS = 5_000
+
+// Ported from the Skye relay: a ping that nobody can hang on forever is not a
+// prompt. A permission still pending after this long is rejected so the agent
+// moves on instead of waiting for a phone that is not coming back.
+const PERMISSION_TIMEOUT_MS = 10 * 60_000
+const PERMISSION_POLL_MS_WHILE_WAITING = 1_500
+
+// Skye trimmed ping bodies hard so they read on a lock screen.
+const PING_BODY_CHARS = 350
 
 type Config = { project: string; keyFile: string; port: number }
 
@@ -193,7 +202,7 @@ export const OpenCodeMobilePushPlugin: Plugin = async ({ client, directory, serv
   const cfg = loadConfig()
   debug(`factory start host=${process.env.OPENCODE_PUSH_HOST ?? "<unset>"} config=${cfg ? "ok" : "missing"}`)
   if (!cfg) {
-    log("warn", "no mobile-push.json (project/keyFile) â€” push disabled")
+    log("warn", "no mobile-push.json (project/keyFile) — push disabled")
     return {}
   }
 
@@ -218,7 +227,7 @@ export const OpenCodeMobilePushPlugin: Plugin = async ({ client, directory, serv
   // phone) has connected and opened a session.
   const bindHost = process.env.OPENCODE_PUSH_HOST
   if (!bindHost) {
-    log("info", "OPENCODE_PUSH_HOST not set â€” push endpoint disabled in this process")
+    log("info", "OPENCODE_PUSH_HOST not set — push endpoint disabled in this process")
     return {}
   }
   if (!listenerStarted) {
@@ -248,7 +257,7 @@ export const OpenCodeMobilePushPlugin: Plugin = async ({ client, directory, serv
           if (!afk.isArmed()) return { ok: false, sent: 0, error: "AFK is not armed" }
           await pusher.push({
             category: "permissions",
-            title: "Permission needed Â· test",
+            title: "Permission needed · test",
             // Unique per call: repeats are deduped by content, and a test the
             // user has to wait 20s to repeat is a test nobody repeats.
             body: `This is a test. Approve or Reject right here. (${new Date().toLocaleTimeString()})`,
@@ -318,35 +327,99 @@ export const OpenCodeMobilePushPlugin: Plugin = async ({ client, directory, serv
   // else (allowed by a rule, or already answered from the laptop) must go quiet.
   const pendingPermissions = async (): Promise<Record<string, unknown>[] | null> => {
     if (!auth.password || !serverUrl) return null
+    // Skye polled both shapes: the bare list and the directory-scoped one.
+    // Questions only ever appear scoped; permissions have been seen in either.
+    const paths = [`/permission?directory=${encodeURIComponent(directory)}`, "/permission"]
     try {
-      // Directory-scoped: the bare list returns [] even with entries pending.
-      const res = await fetch(new URL(`/permission?directory=${encodeURIComponent(directory)}`, serverUrl), {
-        headers: {
-          Authorization: `Basic ${Buffer.from(`${auth.user}:${auth.password}`).toString("base64")}`,
-        },
-        signal: AbortSignal.timeout(5_000),
-      })
-      if (!res.ok) return null
-      const list = (await res.json()) as unknown
-      return Array.isArray(list) ? (list as Record<string, unknown>[]) : null
+      const lists = await Promise.all(
+        paths.map(async (pathname) => {
+          const res = await fetch(new URL(pathname, serverUrl), {
+            headers: {
+              Authorization: `Basic ${Buffer.from(`${auth.user}:${auth.password}`).toString("base64")}`,
+            },
+            signal: AbortSignal.timeout(5_000),
+          })
+          if (!res.ok) return null
+          const list = (await res.json()) as unknown
+          return Array.isArray(list) ? (list as Record<string, unknown>[]) : null
+        }),
+      )
+      if (lists.every((list) => list === null)) return null
+      const merged = new Map<string, Record<string, unknown>>()
+      for (const list of lists) for (const entry of list ?? []) merged.set(String(entry?.id ?? ""), entry)
+      return [...merged.values()]
     } catch {
       return null
     }
   }
 
+  const replyToPermission = async (id: string, reply: string) => {
+    if (!auth.password || !serverUrl) return
+    try {
+      await fetch(new URL(`/permission/${encodeURIComponent(id)}/reply`, serverUrl), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Basic ${Buffer.from(`${auth.user}:${auth.password}`).toString("base64")}`,
+        },
+        body: JSON.stringify({ reply }),
+        signal: AbortSignal.timeout(5_000),
+      })
+    } catch {}
+  }
+
+  // Skye's waiters are the reason its pings felt dependable: while a prompt was
+  // outstanding something on the server was watching it, so a permission could
+  // not outlive the phone's attention. Two outcomes matter here — the request
+  // goes away (answered on the laptop, nothing to do) or it is still there when
+  // the deadline passes (reject, so the agent is not parked forever).
+  const watching = new Set<string>()
+
+  const watchPermission = (id: string) => {
+    if (watching.has(id)) return
+    watching.add(id)
+    const deadline = Date.now() + PERMISSION_TIMEOUT_MS
+    void (async () => {
+      try {
+        while (Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, PERMISSION_POLL_MS_WHILE_WAITING))
+          const pending = await pendingPermissions()
+          if (!pending) continue
+          if (!pending.some((entry) => String(entry?.id ?? "") === id)) return
+        }
+        await replyToPermission(id, "reject")
+        log("info", `permission ${id} timed out — rejected so the agent moves on`)
+      } finally {
+        watching.delete(id)
+      }
+    })()
+  }
+
   // Events are hints; the pending list is the truth. opencode raises
   // permission.asked for requests it then auto-allows, so pinging on the event
-  // alone shouts about work that already ran â€” the old Skye relay learned the
+  // alone shouts about work that already ran — the old Skye relay learned the
   // same thing and polled the list instead of trusting the stream. Polling also
   // catches whatever the event hook misses, and an id is only ever announced
   // once, however many times it appears.
   const announcedPermissions = new Set<string>()
   const ANNOUNCED_MEMORY = 200
+  let lastPendingCount: number | null = null
 
   const announcePermissions = async () => {
     if (!afk.isArmed()) return
+    // Skye never started a waiter it could not deliver to, and it never marked a
+    // ping as sent when no phone had received it. Without this an id would be
+    // burned while the app is not yet registered, and the prompt would never be
+    // announced again.
+    if (!tokens.list().length) return
     const pending = await pendingPermissions()
     if (!pending) return
+    // Edge-triggered, so the trace stays readable while proving the watcher is
+    // alive (a silent poller is indistinguishable from a working one otherwise).
+    if (pending.length !== lastPendingCount) {
+      lastPendingCount = pending.length
+      debug(`pending permissions: ${pending.length}`)
+    }
     for (const entry of pending) {
       const id = String(entry.id ?? "")
       if (!id || announcedPermissions.has(id)) continue
@@ -365,11 +438,14 @@ export const OpenCodeMobilePushPlugin: Plugin = async ({ client, directory, serv
       const sessionID = String(entry.sessionID ?? "")
       await push({
         category: "permissions",
-        title: `Permission needed Â· ${project}`,
-        body: [label, detail].filter(Boolean).join(": ") || label,
+        title: `🔐 Permission · ${project}`,
+        body: trim([label, detail].filter(Boolean).join(": ") || label, PING_BODY_CHARS),
         ...(sessionID ? { sessionId: sessionID } : {}),
         permissionId: id,
       })
+      // Something is now watching the prompt: it either goes away (answered
+      // elsewhere) or gets rejected at the deadline.
+      watchPermission(id)
     }
   }
 
@@ -389,11 +465,16 @@ export const OpenCodeMobilePushPlugin: Plugin = async ({ client, directory, serv
         if (input?.tool !== "question") return
         const questions = (output?.args as { questions?: Array<{ question?: string }> } | undefined)?.questions
         if (!Array.isArray(questions) || questions.length === 0) return
-        const body = questions.map((q) => String(q?.question ?? "")).join(" | ")
+        // Skye numbered multi-question pings so the lock screen shows that a
+        // choice is expected, not a wall of text.
+        const asked = questions.map((q) => String(q?.question ?? "")).filter(Boolean)
+        const body = asked
+          .map((question, index) => (asked.length > 1 ? `Q${index + 1}: ${question}` : question))
+          .join(" ")
         await push({
           category: "questions",
-          title: `Question Â· ${project}`,
-          body: sentenceDigest(body, { maxChars: 200 }) || "The agent needs your input",
+          title: `❓ Question · ${project}`,
+          body: trim(body, PING_BODY_CHARS) || "The agent needs your input",
           sessionId: input.sessionID,
         })
       } catch (e) {
@@ -418,7 +499,7 @@ export const OpenCodeMobilePushPlugin: Plugin = async ({ client, directory, serv
           const summary = await lastAssistantText(sessionID)
           await push({
             category: "completed",
-            title: `Done Â· ${project}`,
+            title: `✅ Done · ${project}`,
             body: sentenceDigest(summary, { maxChars: DONE_SUMMARY_CHARS }) || "opencode finished a turn",
             sessionId: sessionID,
           })

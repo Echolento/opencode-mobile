@@ -5,7 +5,7 @@ import os from "node:os"
 import path from "node:path"
 import type { IncomingMessage } from "node:http"
 import type { AddressInfo } from "node:net"
-import { createAfkStore, createAckWaiter, createPushServer, createPusher, createTokenStore } from "./lib.ts"
+import { createAfkStore, createAckWaiter, createPushServer, createPusher, createTokenStore, trim } from "./lib.ts"
 import type { PushMessage } from "./lib.ts"
 
 // AFK arming is the switch that decides whether the phone gets pinged at all.
@@ -439,3 +439,11 @@ test("a malformed test request is rejected instead of sending something unexpect
 })
 
 
+
+test("a label body is cut to width with an ellipsis, never mid-word padding", () => {
+  assert.equal(trim("bash: npm run build", 350), "bash: npm run build")
+  const cut = trim("a".repeat(400), 20)
+  assert.equal(cut.length, 20)
+  assert.ok(cut.endsWith("\u2026"))
+  assert.equal(trim("  padded   value  ", 50), "padded value")
+})

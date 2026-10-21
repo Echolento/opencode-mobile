@@ -93,10 +93,11 @@ project), so the app retries registration for a short while after connecting.
   checked.
 - `POST /push/ack` lets the app confirm it displayed a data-only push, which
   suppresses the fallback described below.
-- On `permission.asked` / `permission.v2.asked` → "Permission needed".
-- On the `question` tool → "Question".
-- On `session.idle` after real work → "Done", carrying a sentence-aware digest of
-  the agent's closing message (whole sentences only, no model call).
+- A permission is announced only while it is actually **pending** (see below),
+  titled "🔐 Permission".
+- On the `question` tool → "❓ Question", multi-question prompts numbered.
+- On `session.idle` after real work → "✅ Done", carrying a sentence-aware digest
+  of the agent's closing message (whole sentences only, no model call).
 
 All sends fire **only while AFK is armed**; `/back` (laptop) or `POST
 /afk/disarm` (phone) silences them. Arming has no expiry — it is intent, and it
@@ -105,6 +106,22 @@ the moment you arm. Duplicate sends within 20s are suppressed.
 
 Every notification carries `category`/`sessionId` (and `permissionId` for
 permission asks) as data, which is what the app deep-links on.
+
+### Only pending permissions are announced
+
+An event is a hint, not a fact. opencode raises `permission.asked` for **every**
+request it evaluates, before a rule decides, so a command that is auto-allowed
+looks exactly like one that blocks the agent. Announcing on the event alone woke
+the phone for work that had already run — eight times for one ordinary command.
+
+So the pending list is the truth: `/permission` is re-read (both bare and
+`directory`-scoped) every 5s while armed, plus shortly after each event, and only
+ids still on that list are announced, once each. A request a rule allows never
+appears twice, so it never pings. A request that is announced gets a watcher —
+borrowed from the older Skye relay, which was reliable for exactly this reason:
+if it is answered on the laptop the watcher simply stops, and if it is still
+unanswered after ten minutes it is rejected so the agent is not parked forever
+waiting on a phone that is not coming back.
 
 ### Permission notifications are sent twice, on purpose
 
