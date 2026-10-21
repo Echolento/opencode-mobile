@@ -3,6 +3,7 @@ import * as Device from "expo-device"
 import { Platform, AppState } from "react-native"
 import { tapData, type TapData } from "./push-data"
 import { registerPushBackground } from "./push-background"
+import { serverOwns } from "./server-owned"
 
 // ---------------------------------------------------------------------------
 // Categories — every notification belongs to exactly one
@@ -161,6 +162,7 @@ async function ensureChannel() {
 // ---------------------------------------------------------------------------
 
 export async function send(payload: Payload) {
+  if (serverOwns(payload.category)) return
   const prefs = preferences()
   if (!prefs[payload.category]) return
   if (AppState.currentState === "active") return

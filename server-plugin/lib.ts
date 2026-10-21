@@ -236,17 +236,6 @@ export type TestPushResult = { ok: boolean; sent?: number; error?: string }
  *  waiting for the agent to actually need approval. */
 export type TestPushOptions = { permissionId?: string; sessionId?: string }
 
-/** opencode emits `permission.asked` for every request it evaluates, including
- *  the ones a rule auto-allows; those are never waiting on a human, so waking
- *  someone for them is pure noise. Only an id still on the pending list is
- *  actually blocking the agent. A null list means "could not check" and is
- *  treated as pending, because a missed block is worse than a spare ping. */
-export function stillPending(id: string, pending: { id?: unknown }[] | null): boolean {
-  if (!id) return false
-  if (pending === null) return true
-  return pending.some((entry) => String(entry?.id ?? "") === id)
-}
-
 export function createPushServer({
   store,
   tokens,

@@ -5,7 +5,7 @@ import os from "node:os"
 import path from "node:path"
 import type { IncomingMessage } from "node:http"
 import type { AddressInfo } from "node:net"
-import { createAfkStore, createAckWaiter, createPushServer, createPusher, createTokenStore, stillPending } from "./lib.ts"
+import { createAfkStore, createAckWaiter, createPushServer, createPusher, createTokenStore } from "./lib.ts"
 import type { PushMessage } from "./lib.ts"
 
 // AFK arming is the switch that decides whether the phone gets pinged at all.
@@ -438,9 +438,4 @@ test("a malformed test request is rejected instead of sending something unexpect
   }
 })
 
-test("a permission is only worth a ping while the server still lists it as pending", () => {
-  assert.equal(stillPending("perm-1", [{ id: "perm-1" }, { id: "perm-2" }]), true)
-  assert.equal(stillPending("perm-1", [{ id: "perm-2" }]), false, "an auto-allowed request is already gone")
-  assert.equal(stillPending("perm-1", null), true, "uncheckable must not silence a real block")
-  assert.equal(stillPending("", [{ id: "perm-1" }]), false)
-})
+

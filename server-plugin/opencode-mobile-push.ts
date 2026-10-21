@@ -4,15 +4,15 @@ import http from "node:http"
 import os from "node:os"
 import path from "node:path"
 import crypto from "node:crypto"
-import { createAckWaiter, createAfkStore, createPusher, createPushServer, createTokenStore, readJson, sentenceDigest, stillPending } from "./lib"
+import { createAckWaiter, createAfkStore, createPusher, createPushServer, createTokenStore, readJson, sentenceDigest } from "./lib"
 import type { PushContent, SendPush } from "./lib"
 
-// opencode-mobile-push — server-side half of reliable push for OpenCode Mobile.
+// opencode-mobile-push â€” server-side half of reliable push for OpenCode Mobile.
 //
 // Why: the app cannot be relied on to hold a background SSE socket (Android
 // suspends it), so it never gets a chance to schedule its local notifications.
 // Instead the app hands its FCM token to this plugin, and the plugin pushes
-// from the server on the events that matter — with the app cold/killed.
+// from the server on the events that matter â€” with the app cold/killed.
 //
 // Pings fire ONLY while /afk is armed (shared afk/state.json). The phone arms it
 // by texting (POST /afk/arm); /back on the laptop, or POST /afk/disarm from the
@@ -25,7 +25,7 @@ import type { PushContent, SendPush } from "./lib"
 //     "port": 4097
 //   }
 // Env overrides: OPENCODE_PUSH_PROJECT, OPENCODE_PUSH_KEY_FILE, OPENCODE_PUSH_PORT.
-// OPENCODE_PUSH_HOST (e.g. the tailnet IP) is REQUIRED — the endpoint only
+// OPENCODE_PUSH_HOST (e.g. the tailnet IP) is REQUIRED â€” the endpoint only
 // starts in the process given it, so the supervisor's `serve` binds and other
 // opencode processes stay silent. It is also the interface to bind.
 //
@@ -69,6 +69,10 @@ const ACK_TIMEOUT_MS = 8_000
 // event alone says nothing about whether a human is needed. Give the request a
 // moment to be cancelled by a rule, then ask the server what is still waiting.
 const PERMISSION_CONFIRM_MS = 1_500
+
+// How often the pending list is re-read while the phone is armed. Cheap (one
+// request to the local server) and it is what makes a missed event harmless.
+const PERMISSION_POLL_MS = 5_000
 
 type Config = { project: string; keyFile: string; port: number }
 
@@ -189,7 +193,7 @@ export const OpenCodeMobilePushPlugin: Plugin = async ({ client, directory, serv
   const cfg = loadConfig()
   debug(`factory start host=${process.env.OPENCODE_PUSH_HOST ?? "<unset>"} config=${cfg ? "ok" : "missing"}`)
   if (!cfg) {
-    log("warn", "no mobile-push.json (project/keyFile) — push disabled")
+    log("warn", "no mobile-push.json (project/keyFile) â€” push disabled")
     return {}
   }
 
@@ -214,11 +218,14 @@ export const OpenCodeMobilePushPlugin: Plugin = async ({ client, directory, serv
   // phone) has connected and opened a session.
   const bindHost = process.env.OPENCODE_PUSH_HOST
   if (!bindHost) {
-    log("info", "OPENCODE_PUSH_HOST not set — push endpoint disabled in this process")
+    log("info", "OPENCODE_PUSH_HOST not set â€” push endpoint disabled in this process")
     return {}
   }
   if (!listenerStarted) {
     listenerStarted = true
+    // Backstop for the event nudge: keeps the phone honest even if the stream
+    // drops a permission (or the process never saw the session that raised it).
+    setInterval(() => void announcePermissions(), PERMISSION_POLL_MS).unref()
     const server = createPushServer({
       store: afk,
       tokens,
@@ -241,7 +248,7 @@ export const OpenCodeMobilePushPlugin: Plugin = async ({ client, directory, serv
           if (!afk.isArmed()) return { ok: false, sent: 0, error: "AFK is not armed" }
           await pusher.push({
             category: "permissions",
-            title: "Permission needed · test",
+            title: "Permission needed Â· test",
             // Unique per call: repeats are deduped by content, and a test the
             // user has to wait 20s to repeat is a test nobody repeats.
             body: `This is a test. Approve or Reject right here. (${new Date().toLocaleTimeString()})`,
@@ -309,9 +316,10 @@ export const OpenCodeMobilePushPlugin: Plugin = async ({ client, directory, serv
 
   // A permission ping is only useful if the agent is actually stuck. Anything
   // else (allowed by a rule, or already answered from the laptop) must go quiet.
-  const pendingPermissions = async (): Promise<{ id?: unknown }[] | null> => {
+  const pendingPermissions = async (): Promise<Record<string, unknown>[] | null> => {
     if (!auth.password || !serverUrl) return null
     try {
+      // Directory-scoped: the bare list returns [] even with entries pending.
       const res = await fetch(new URL(`/permission?directory=${encodeURIComponent(directory)}`, serverUrl), {
         headers: {
           Authorization: `Basic ${Buffer.from(`${auth.user}:${auth.password}`).toString("base64")}`,
@@ -320,15 +328,55 @@ export const OpenCodeMobilePushPlugin: Plugin = async ({ client, directory, serv
       })
       if (!res.ok) return null
       const list = (await res.json()) as unknown
-      return Array.isArray(list) ? (list as { id?: unknown }[]) : null
+      return Array.isArray(list) ? (list as Record<string, unknown>[]) : null
     } catch {
       return null
     }
   }
 
-  const permissionStillPending = async (id: string): Promise<boolean> => {
-    await new Promise((resolve) => setTimeout(resolve, PERMISSION_CONFIRM_MS))
-    return stillPending(id, await pendingPermissions())
+  // Events are hints; the pending list is the truth. opencode raises
+  // permission.asked for requests it then auto-allows, so pinging on the event
+  // alone shouts about work that already ran â€” the old Skye relay learned the
+  // same thing and polled the list instead of trusting the stream. Polling also
+  // catches whatever the event hook misses, and an id is only ever announced
+  // once, however many times it appears.
+  const announcedPermissions = new Set<string>()
+  const ANNOUNCED_MEMORY = 200
+
+  const announcePermissions = async () => {
+    if (!afk.isArmed()) return
+    const pending = await pendingPermissions()
+    if (!pending) return
+    for (const entry of pending) {
+      const id = String(entry.id ?? "")
+      if (!id || announcedPermissions.has(id)) continue
+      announcedPermissions.add(id)
+      if (announcedPermissions.size > ANNOUNCED_MEMORY) {
+        const oldest = announcedPermissions.values().next().value
+        if (oldest) announcedPermissions.delete(oldest)
+      }
+      const label = String(entry.permission ?? entry.action ?? "permission")
+      const patterns = Array.isArray(entry.patterns)
+        ? entry.patterns
+        : Array.isArray(entry.resources)
+          ? entry.resources
+          : []
+      const detail = patterns.map(String).join(", ")
+      const sessionID = String(entry.sessionID ?? "")
+      await push({
+        category: "permissions",
+        title: `Permission needed Â· ${project}`,
+        body: [label, detail].filter(Boolean).join(": ") || label,
+        ...(sessionID ? { sessionId: sessionID } : {}),
+        permissionId: id,
+      })
+    }
+  }
+
+  // Let a rule finish deciding before asking the list, so an auto-allowed
+  // request is never announced in the window between event and cancellation.
+  const announcePermissionsSoon = () => {
+    setTimeout(() => void announcePermissions(), PERMISSION_CONFIRM_MS)
   }
 
   return {
@@ -344,7 +392,7 @@ export const OpenCodeMobilePushPlugin: Plugin = async ({ client, directory, serv
         const body = questions.map((q) => String(q?.question ?? "")).join(" | ")
         await push({
           category: "questions",
-          title: `Question · ${project}`,
+          title: `Question Â· ${project}`,
           body: sentenceDigest(body, { maxChars: 200 }) || "The agent needs your input",
           sessionId: input.sessionID,
         })
@@ -359,24 +407,8 @@ export const OpenCodeMobilePushPlugin: Plugin = async ({ client, directory, serv
         const props = ((event as { properties?: Record<string, unknown> }).properties ?? {}) as Record<string, unknown>
 
         if (type === "permission.asked" || type === "permission.v2.asked") {
-          const permissionId = String(props.id ?? "")
-          if (!permissionId) return
-          if (!(await permissionStillPending(permissionId))) {
-            debug(`permission ${permissionId} was auto-allowed or already answered; staying quiet`)
-            return
-          }
-          const label =
-            type === "permission.v2.asked" ? String(props.action ?? "permission") : String(props.permission ?? "permission")
-          const patterns = (type === "permission.v2.asked" ? props.resources : props.patterns) as unknown
-          const detail = Array.isArray(patterns) ? patterns.map(String).join(", ") : ""
-          const sessionId = String(props.sessionID ?? "")
-          await push({
-            category: "permissions",
-            title: `Permission needed · ${project}`,
-            body: [label, detail].filter(Boolean).join(": ") || label,
-            ...(sessionId ? { sessionId } : {}),
-            permissionId,
-          })
+          if (!String(props.id ?? "")) return
+          announcePermissionsSoon()
           return
         }
 
@@ -386,7 +418,7 @@ export const OpenCodeMobilePushPlugin: Plugin = async ({ client, directory, serv
           const summary = await lastAssistantText(sessionID)
           await push({
             category: "completed",
-            title: `Done · ${project}`,
+            title: `Done Â· ${project}`,
             body: sentenceDigest(summary, { maxChars: DONE_SUMMARY_CHARS }) || "opencode finished a turn",
             sessionId: sessionID,
           })
