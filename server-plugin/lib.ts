@@ -231,6 +231,22 @@ const MAX_BODY = 8192
 
 export type TestPushResult = { ok: boolean; sent?: number; error?: string }
 
+/** A test push normally proves delivery. Given a permission id it instead poses
+ *  a permission, which is how the Approve/Reject buttons get exercised without
+ *  waiting for the agent to actually need approval. */
+export type TestPushOptions = { permissionId?: string; sessionId?: string }
+
+/** opencode emits `permission.asked` for every request it evaluates, including
+ *  the ones a rule auto-allows; those are never waiting on a human, so waking
+ *  someone for them is pure noise. Only an id still on the pending list is
+ *  actually blocking the agent. A null list means "could not check" and is
+ *  treated as pending, because a missed block is worse than a spare ping. */
+export function stillPending(id: string, pending: { id?: unknown }[] | null): boolean {
+  if (!id) return false
+  if (pending === null) return true
+  return pending.some((entry) => String(entry?.id ?? "") === id)
+}
+
 export function createPushServer({
   store,
   tokens,
@@ -246,7 +262,7 @@ export function createPushServer({
   /** Delivers a notification regardless of AFK state: the point is to prove
    *  delivery works, and a user who armed nothing still needs to test their
    *  phone. Optional, so a server can stay send-only. */
-  sendTest?: () => Promise<TestPushResult>
+  sendTest?: (options?: TestPushOptions) => Promise<TestPushResult>
   /** Called when the app confirms it displayed a data-only push, which is what
    *  suppresses the system-rendered fallback. */
   onAck?: (pushId: string) => void
@@ -326,15 +342,31 @@ export function createPushServer({
         res.writeHead(404).end()
         return
       }
-      void sendTest()
-        .then((result) => {
-          res.writeHead(result.ok ? 200 : 502, { "Content-Type": "application/json" }).end(JSON.stringify(result))
-        })
-        .catch((e: unknown) => {
-          res
-            .writeHead(502, { "Content-Type": "application/json" })
-            .end(JSON.stringify({ ok: false, error: String(e) } satisfies TestPushResult))
-        })
+      let body = ""
+      req.on("data", (chunk) => {
+        body += chunk
+        if (body.length > MAX_BODY) req.destroy()
+      })
+      req.on("end", () => {
+        let options: TestPushOptions = {}
+        if (body.trim()) {
+          try {
+            options = JSON.parse(body) as TestPushOptions
+          } catch {
+            res.writeHead(400, { "Content-Type": "application/json" }).end(JSON.stringify({ ok: false, error: "bad json" }))
+            return
+          }
+        }
+        void sendTest(options)
+          .then((result) => {
+            res.writeHead(result.ok ? 200 : 502, { "Content-Type": "application/json" }).end(JSON.stringify(result))
+          })
+          .catch((e: unknown) => {
+            res
+              .writeHead(502, { "Content-Type": "application/json" })
+              .end(JSON.stringify({ ok: false, error: String(e) } satisfies TestPushResult))
+          })
+      })
       return
     }
     res.writeHead(404).end()

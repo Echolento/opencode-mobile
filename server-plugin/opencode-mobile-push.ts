@@ -4,7 +4,7 @@ import http from "node:http"
 import os from "node:os"
 import path from "node:path"
 import crypto from "node:crypto"
-import { createAckWaiter, createAfkStore, createPusher, createPushServer, createTokenStore, readJson, sentenceDigest } from "./lib"
+import { createAckWaiter, createAfkStore, createPusher, createPushServer, createTokenStore, readJson, sentenceDigest, stillPending } from "./lib"
 import type { PushContent, SendPush } from "./lib"
 
 // opencode-mobile-push — server-side half of reliable push for OpenCode Mobile.
@@ -64,6 +64,11 @@ const DONE_SUMMARY_CHARS = 200
 // enough for a dozing phone to wake and reach the server, short enough that the
 // user is not left waiting when it cannot.
 const ACK_TIMEOUT_MS = 8_000
+
+// opencode raises `permission.asked` for requests it then auto-allows, so the
+// event alone says nothing about whether a human is needed. Give the request a
+// moment to be cancelled by a rule, then ask the server what is still waiting.
+const PERMISSION_CONFIRM_MS = 1_500
 
 type Config = { project: string; keyFile: string; port: number }
 
@@ -229,9 +234,22 @@ export const OpenCodeMobilePushPlugin: Plugin = async ({ client, directory, serv
       // Delivery is the one link the app cannot verify for itself: it only sees
       // that it handed a token over. This sends one real notification so the
       // phone, not just the server, can confirm the chain end to end.
-      sendTest: async () => {
+      sendTest: async (options) => {
         const deviceTokens = tokens.list().map((entry) => entry.token)
         if (!deviceTokens.length) return { ok: false, sent: 0, error: "no device registered" }
+        if (options?.permissionId) {
+          if (!afk.isArmed()) return { ok: false, sent: 0, error: "AFK is not armed" }
+          await pusher.push({
+            category: "permissions",
+            title: "Permission needed · test",
+            // Unique per call: repeats are deduped by content, and a test the
+            // user has to wait 20s to repeat is a test nobody repeats.
+            body: `This is a test. Approve or Reject right here. (${new Date().toLocaleTimeString()})`,
+            permissionId: options.permissionId,
+            sessionId: options.sessionId,
+          })
+          return { ok: true, sent: deviceTokens.length }
+        }
         const body = "Push is working. This notification came from your OpenCode server."
         let sent = 0
         for (const token of deviceTokens) {
@@ -289,6 +307,30 @@ export const OpenCodeMobilePushPlugin: Plugin = async ({ client, directory, serv
     return ""
   }
 
+  // A permission ping is only useful if the agent is actually stuck. Anything
+  // else (allowed by a rule, or already answered from the laptop) must go quiet.
+  const pendingPermissions = async (): Promise<{ id?: unknown }[] | null> => {
+    if (!auth.password || !serverUrl) return null
+    try {
+      const res = await fetch(new URL(`/permission?directory=${encodeURIComponent(directory)}`, serverUrl), {
+        headers: {
+          Authorization: `Basic ${Buffer.from(`${auth.user}:${auth.password}`).toString("base64")}`,
+        },
+        signal: AbortSignal.timeout(5_000),
+      })
+      if (!res.ok) return null
+      const list = (await res.json()) as unknown
+      return Array.isArray(list) ? (list as { id?: unknown }[]) : null
+    } catch {
+      return null
+    }
+  }
+
+  const permissionStillPending = async (id: string): Promise<boolean> => {
+    await new Promise((resolve) => setTimeout(resolve, PERMISSION_CONFIRM_MS))
+    return stillPending(id, await pendingPermissions())
+  }
+
   return {
     "tool.execute.after": async (input) => {
       if (WORK_TOOLS.has(String(input?.tool))) didWork.add(String(input?.sessionID))
@@ -317,6 +359,12 @@ export const OpenCodeMobilePushPlugin: Plugin = async ({ client, directory, serv
         const props = ((event as { properties?: Record<string, unknown> }).properties ?? {}) as Record<string, unknown>
 
         if (type === "permission.asked" || type === "permission.v2.asked") {
+          const permissionId = String(props.id ?? "")
+          if (!permissionId) return
+          if (!(await permissionStillPending(permissionId))) {
+            debug(`permission ${permissionId} was auto-allowed or already answered; staying quiet`)
+            return
+          }
           const label =
             type === "permission.v2.asked" ? String(props.action ?? "permission") : String(props.permission ?? "permission")
           const patterns = (type === "permission.v2.asked" ? props.resources : props.patterns) as unknown
@@ -327,7 +375,7 @@ export const OpenCodeMobilePushPlugin: Plugin = async ({ client, directory, serv
             title: `Permission needed · ${project}`,
             body: [label, detail].filter(Boolean).join(": ") || label,
             ...(sessionId ? { sessionId } : {}),
-            permissionId: String(props.id ?? ""),
+            permissionId,
           })
           return
         }

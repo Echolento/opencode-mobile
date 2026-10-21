@@ -5,7 +5,7 @@ import os from "node:os"
 import path from "node:path"
 import type { IncomingMessage } from "node:http"
 import type { AddressInfo } from "node:net"
-import { createAfkStore, createAckWaiter, createPushServer, createPusher, createTokenStore } from "./lib.ts"
+import { createAfkStore, createAckWaiter, createPushServer, createPusher, createTokenStore, stillPending } from "./lib.ts"
 import type { PushMessage } from "./lib.ts"
 
 // AFK arming is the switch that decides whether the phone gets pinged at all.
@@ -398,4 +398,49 @@ test("a permission without an id cannot be acted on, so it is not sent data-only
   await pusher.push({ category: "permissions", title: "Permission", body: "rm -rf" })
   assert.equal(sent.length, 1)
   assert.ok(sent[0].notification)
+})
+
+test("a test push can pose a permission so the buttons can be tried on demand", async () => {
+  let received: { permissionId?: string; sessionId?: string } | undefined
+  const server = await startTestServer(async (options) => {
+    received = options
+    return { ok: true, sent: 1 }
+  })
+  try {
+    const res = await fetch(`${server.base}/push/test`, {
+      method: "POST",
+      headers: { Authorization: AUTH, "Content-Type": "application/json" },
+      body: JSON.stringify({ permissionId: "perm-7", sessionId: "ses-1" }),
+    })
+    assert.equal(res.status, 200)
+    assert.deepEqual(received, { permissionId: "perm-7", sessionId: "ses-1" })
+  } finally {
+    await server.close()
+  }
+})
+
+test("a malformed test request is rejected instead of sending something unexpected", async () => {
+  let called = false
+  const server = await startTestServer(async () => {
+    called = true
+    return { ok: true, sent: 1 }
+  })
+  try {
+    const res = await fetch(`${server.base}/push/test`, {
+      method: "POST",
+      headers: { Authorization: AUTH, "Content-Type": "application/json" },
+      body: "{not json",
+    })
+    assert.equal(res.status, 400)
+    assert.equal(called, false)
+  } finally {
+    await server.close()
+  }
+})
+
+test("a permission is only worth a ping while the server still lists it as pending", () => {
+  assert.equal(stillPending("perm-1", [{ id: "perm-1" }, { id: "perm-2" }]), true)
+  assert.equal(stillPending("perm-1", [{ id: "perm-2" }]), false, "an auto-allowed request is already gone")
+  assert.equal(stillPending("perm-1", null), true, "uncheckable must not silence a real block")
+  assert.equal(stillPending("", [{ id: "perm-1" }]), false)
 })
